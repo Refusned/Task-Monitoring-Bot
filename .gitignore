@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# Environment & secrets (REAL credentials never go to git)
+.env
+.env.*
+!.env.example
+
+# Database / runtime state
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+bot.log
+bot.lock
+bot.pid
+.watcher_state.json
+
+# Testing / linting caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

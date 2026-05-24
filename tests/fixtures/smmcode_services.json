@@ -1,0 +1,38 @@
+{
+    "services": {
+        "instagram": {
+            "podpisciki": {
+                "136": {
+                    "service_id": 136,
+                    "price": 0.05,
+                    "min": 20,
+                    "max": 5000,
+                    "name": "Мир (Боты) | Аватарка + Посты",
+                    "description": null,
+                    "speed_ts": 113067
+                },
+                "135": {
+                    "service_id": 135,
+                    "price": 0.123,
+                    "min": 50,
+                    "max": 100000,
+                    "name": "Боты | Хорошее качество",
+                    "description": null,
+                    "speed_ts": 93802
+                }
+            },
+            "likes": {
+                "207": {
+                    "service_id": 207,
+                    "price": 0.484,
+                    "min": 10,
+                    "max": 10000,
+                    "name": "YouTube views demo",
+                    "description": null,
+                    "speed_ts": 50000
+                }
+            }
+        }
+    },
+    "status": 200
+}

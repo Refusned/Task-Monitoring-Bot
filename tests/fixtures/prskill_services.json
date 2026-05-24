@@ -1,0 +1,29 @@
+[
+    {
+        "service": 1,
+        "name": "Instagram Followers",
+        "category": "Instagram",
+        "rate": "0.90",
+        "min": "50",
+        "max": "10000",
+        "fields": [{"label":"Ссылка на страницу инстаграм","name":"service_url", "required": true}]
+    },
+    {
+        "service": 2,
+        "name": "YouTube Subscribers",
+        "category": "YouTube",
+        "rate": "1.50",
+        "min": "100",
+        "max": "50000",
+        "fields": [{"label":"Ссылка на канал","name":"service_url", "required": true}]
+    },
+    {
+        "service": 136,
+        "name": "Telegram Members",
+        "category": "Telegram",
+        "rate": "0.05",
+        "min": "10",
+        "max": "100000",
+        "fields": [{"label":"Ссылка на канал","name":"service_url", "required": true}]
+    }
+]
