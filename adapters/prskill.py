@@ -21,7 +21,6 @@ Notable behaviours:
 from __future__ import annotations
 
 import time
-import warnings
 from typing import Any
 
 import httpx
@@ -57,20 +56,20 @@ class PrskillAdapter(PanelAdapter):
         self._services_cache_at: float = 0.0
 
     def capabilities(self) -> set[Capability]:
+        # NB: GET_BALANCE intentionally absent — prskill's public API has no
+        # `balance` action ("The selected action is invalid" on POST). The bot's
+        # /balance reply will honestly show "баланс не отдаётся API" rather than
+        # a fake 0.00. Track balance via the web cabinet.
         return {
             Capability.CREATE_ORDER,
             Capability.GET_ORDER_STATUS,
-            Capability.GET_BALANCE,
         }
 
     async def get_balance(self) -> float:
-        """No balance endpoint is documented; return 0.0 with a warning."""
-        warnings.warn(
-            "prskill public API does not expose a balance endpoint; "
-            "get_balance returns 0.0. Consider tracking balance externally.",
-            stacklevel=2,
+        raise NotImplementedError(
+            "prskill API does not expose a balance endpoint; track balance "
+            "via the web cabinet"
         )
-        return 0.0
 
     async def create_order(self, spec: OrderSpec, client_order_uuid: str) -> tuple[str, float]:
         if not spec.service_id:

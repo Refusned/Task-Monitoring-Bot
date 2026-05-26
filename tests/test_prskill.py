@@ -34,11 +34,14 @@ def _make_client(
 # --- happy paths --------------------------------------------------------------
 
 
-async def test_prskill_get_balance_warns_and_returns_zero() -> None:
-    with pytest.warns(UserWarning, match="does not expose a balance endpoint"):
-        async with _make_client(lambda r: httpx.Response(200, json={"balance": 0})) as http:
-            adapter = PrskillAdapter("test_key", http)
-            assert await adapter.get_balance() == 0.0
+async def test_prskill_get_balance_raises_not_implemented() -> None:
+    """prskill has no public `balance` action. Adapter raises rather than
+    returning a fake 0.0; `capabilities()` also honestly omits GET_BALANCE.
+    """
+    async with _make_client(lambda r: httpx.Response(200, json={"balance": 0})) as http:
+        adapter = PrskillAdapter("test_key", http)
+        with pytest.raises(NotImplementedError, match="balance"):
+            await adapter.get_balance()
 
 
 async def test_prskill_create_order_happy_path() -> None:
@@ -236,9 +239,12 @@ async def test_prskill_capabilities_panel_only() -> None:
     async with _make_client(lambda r: httpx.Response(500)) as http:
         adapter = PrskillAdapter("test_key", http)
         caps = adapter.capabilities()
-        assert Capability.CREATE_ORDER in caps
-        assert Capability.GET_BALANCE in caps
-        assert Capability.LIST_SUBMISSIONS not in caps
-        assert Capability.ACCEPT_SUBMISSION not in caps
-        assert Capability.REJECT_SUBMISSION not in caps
-        assert Capability.SUPPORTS_CLIENT_ORDER_ID not in caps
+    assert Capability.CREATE_ORDER in caps
+    assert Capability.GET_ORDER_STATUS in caps
+    # GET_BALANCE intentionally absent: prskill API has no `balance` action,
+    # /balance reply shows "баланс не отдаётся API" honestly.
+    assert Capability.GET_BALANCE not in caps
+    assert Capability.LIST_SUBMISSIONS not in caps
+    assert Capability.ACCEPT_SUBMISSION not in caps
+    assert Capability.REJECT_SUBMISSION not in caps
+    assert Capability.SUPPORTS_CLIENT_ORDER_ID not in caps
