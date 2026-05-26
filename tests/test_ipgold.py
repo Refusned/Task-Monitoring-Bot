@@ -1,11 +1,15 @@
-"""Contract tests for IpgoldAdapter — Perfect Panel form.
+"""Contract tests for IpgoldAdapter — Advertiser API (v1, JSON, campaign-based).
 
-ipgold.ru exposes a Perfect-Panel-style API at `https://ipgold.ru/api/v2`.
-The adapter is a `PanelAdapter` (orders are prepaid; no per-submission cycle).
+Source of truth: IPGold OpenAPI 1.1.7 spec.
+- Endpoint:  POST https://ipgold.ru/api/v1/<action>
+- Body:      JSON `{"key": ..., "action": ..., ...params}`
+- Success:   `{"status": "OK", "results": ...}`
+- Errors:    `{"status": "BAD", "errors": [{message, code}]}` on HTTP 200/400/403/429
 """
 
 from __future__ import annotations
 
+import json as jsonlib
 from collections.abc import Callable
 
 import httpx
@@ -13,53 +17,68 @@ import pytest
 
 from adapters.base import Capability, PanelAdapter, TaskExchangeAdapter
 from adapters.ipgold import IpgoldAdapter
-from models import OrderSpec, Scenario
+from models import OrderSpec, Scenario, SourcePlatform
 
 
 def _make_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
-def _body(request: httpx.Request) -> dict[str, str]:
-    return dict(httpx.QueryParams(request.content.decode()))
+def _body(request: httpx.Request) -> dict:
+    return jsonlib.loads(request.content.decode())
 
 
-_SERVICES_LIST = [
-    {"service": "1", "name": "Подписчики Telegram", "rate": "50.0", "min": "100", "max": "10000"},
-    {"service": "2", "name": "Лайки YouTube", "rate": "120.0", "min": "10", "max": "10000"},
+_CAMPAIGN_TYPES = [
     {
-        "service": "3",
-        "name": "Переходы на сайт из соцсетей",
-        "rate": "30.0",
-        "min": "100",
-        "max": "100000",
+        "id": 24,
+        "name": "simple site visit",
+        "price": "0.00015",
+        "currency": "usd",
+        "category": "Site visits",
+        "regularity_variants": [],
+    },
+    {
+        "id": 7,
+        "name": "subscribe to Telegram channel",
+        "price": "0.05",
+        "currency": "rub",
+        "category": "Social subscriptions",
+        "regularity_variants": [],
+    },
+    {
+        "id": 11,
+        "name": "YouTube like",
+        "price": "0.02",
+        "currency": "rub",
+        "category": "Social likes",
+        "regularity_variants": [],
     },
 ]
 
 
-# --- capabilities + shape ----------------------------------------------------
+# --- shape + capabilities ----------------------------------------------------
 
 
-async def test_ipgold_capabilities() -> None:
-    """ipgold is panel-style: create/status/balance, no submission cycle."""
+async def test_ipgold_is_panel_adapter_not_task_exchange() -> None:
+    """ipgold campaign lifecycle is prepaid, no per-submission accept/reject."""
+    async with _make_client(lambda r: httpx.Response(500)) as http:
+        adapter = IpgoldAdapter("test_key", http)
+    assert isinstance(adapter, PanelAdapter)
+    assert not isinstance(adapter, TaskExchangeAdapter)
+
+
+async def test_ipgold_capabilities_no_balance() -> None:
+    """IPGold has no account-level balance endpoint → GET_BALANCE intentionally
+    absent so `/balance` shows the honest 'не отдаётся API' line.
+    """
     async with _make_client(lambda r: httpx.Response(500)) as http:
         adapter = IpgoldAdapter("test_key", http)
         caps = adapter.capabilities()
     assert Capability.CREATE_ORDER in caps
     assert Capability.GET_ORDER_STATUS in caps
-    assert Capability.GET_BALANCE in caps
+    assert Capability.GET_BALANCE not in caps
     assert Capability.LIST_SUBMISSIONS not in caps
     assert Capability.ACCEPT_SUBMISSION not in caps
-    assert Capability.REJECT_SUBMISSION not in caps
-    assert Capability.SUPPORTS_CLIENT_ORDER_ID not in caps
-
-
-async def test_ipgold_is_panel_adapter_not_task_exchange() -> None:
-    """ipgold's lifecycle matches smmcode/prskill — prepaid, no rework."""
-    async with _make_client(lambda r: httpx.Response(500)) as http:
-        adapter = IpgoldAdapter("test_key", http)
-    assert isinstance(adapter, PanelAdapter)
-    assert not isinstance(adapter, TaskExchangeAdapter)
 
 
 async def test_ipgold_requires_non_empty_key() -> None:
@@ -68,125 +87,111 @@ async def test_ipgold_requires_non_empty_key() -> None:
             IpgoldAdapter("", http)
 
 
-# --- happy paths -------------------------------------------------------------
+async def test_ipgold_get_balance_raises_not_implemented() -> None:
+    """No account balance endpoint exists; honest NotImplementedError."""
+    async with _make_client(lambda r: httpx.Response(500)) as http:
+        adapter = IpgoldAdapter("test_key", http)
+        with pytest.raises(NotImplementedError, match="account-level balance"):
+            await adapter.get_balance()
 
 
-async def test_ipgold_get_balance_happy_path() -> None:
+# --- create_order = create_campaign + refill_campaign -----------------------
+
+
+async def test_ipgold_create_order_two_phase_flow() -> None:
+    """`create_order` ⇒ get_campaign_types ⇒ create_campaign ⇒ refill_campaign.
+    Verify the request bodies + URLs + that external_order_id encodes both ids.
+    """
+    seen: list[tuple[str, dict]] = []
+
     def handler(request: httpx.Request) -> httpx.Response:
         body = _body(request)
-        assert request.url.path == "/api/v2"
-        assert body["api_key"] == "test_key"
-        assert body["action"] == "balance"
-        return httpx.Response(200, json={"status": "OK", "balance": "412.34", "currency": "RUB"})
-
-    async with _make_client(handler) as http:
-        adapter = IpgoldAdapter("test_key", http)
-        assert await adapter.get_balance() == pytest.approx(412.34)
-
-
-async def test_ipgold_get_balance_handles_numeric_balance() -> None:
-    """Tolerate `{balance: 100.5}` (float) as well as the string form."""
-    async with _make_client(lambda r: httpx.Response(200, json={"balance": 100.5})) as http:
-        adapter = IpgoldAdapter("test_key", http)
-        assert await adapter.get_balance() == 100.5
-
-
-async def test_ipgold_create_order_happy_path() -> None:
-    add_called = False
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal add_called
-        body = _body(request)
-        if body["action"] == "services":
-            return httpx.Response(200, json=_SERVICES_LIST)
-        if body["action"] == "add":
-            add_called = True
-            assert body["service"] == "1"
-            assert body["link"] == "https://t.me/test_canary"
-            assert body["quantity"] == "200"
-            return httpx.Response(200, json={"order": 9001})
-        return httpx.Response(404, json={"error": "unknown"})
+        assert body["key"] == "test_key"
+        action = body["action"]
+        path = request.url.path
+        seen.append((action, body))
+        if action == "get_campaign_types":
+            assert path == "/api/v1/get_campaign_types"
+            return httpx.Response(200, json={"status": "OK", "results": _CAMPAIGN_TYPES})
+        if action == "create_campaign":
+            assert path == "/api/v1/create_campaign"
+            assert body["type_id"] == 24
+            assert body["url"] == "https://example.com/landing"
+            assert body["actions_per_day"] == 200
+            return httpx.Response(
+                200, json={"status": "OK", "results": {"id": 555111, "type_id": 24}}
+            )
+        if action == "refill_campaign":
+            assert path == "/api/v1/refill_campaign"
+            assert body["type_id"] == 24
+            assert body["id"] == 555111
+            assert body["actions_number"] == 200
+            return httpx.Response(
+                200, json={"status": "OK", "results": {"added": 200, "campaign_balance": 200}}
+            )
+        return httpx.Response(
+            404, json={"status": "BAD", "errors": [{"message": "Unknown action"}]}
+        )
 
     async with _make_client(handler) as http:
         adapter = IpgoldAdapter("test_key", http)
         spec = OrderSpec(
-            scenario=Scenario.ACTIVITY_SUBSCRIBE,
+            scenario=Scenario.SOCIAL_TRAFFIC,
             exchange="ipgold",
-            target="https://t.me/test_canary",
+            target="https://example.com/landing",
             quantity=200,
-            service_id="1",
-            max_cost=50.0,
+            service_id="24",
+            max_cost=1.0,
+            source_platform=SourcePlatform.VK,
         )
         external_id, cost = await adapter.create_order(spec, "uuid-1")
-        assert external_id == "9001"
-        # rate 50 per 1000 → 0.05 per unit; 200 units → 10.00
-        assert cost == pytest.approx(10.0)
-    assert add_called
+    # external_id encodes both type_id and campaign id for later status checks.
+    assert external_id == "24:555111"
+    # type 24 price 0.00015 × 200 = 0.03
+    assert cost == pytest.approx(0.03)
+    # Order of calls: types → create → refill.
+    actions_called = [a for a, _ in seen]
+    assert actions_called == ["get_campaign_types", "create_campaign", "refill_campaign"]
 
 
-@pytest.mark.parametrize(
-    "raw_status, expected",
-    [
-        ("Pending", "in_progress"),
-        ("In progress", "in_progress"),
-        ("Processing", "in_progress"),
-        ("Completed", "completed"),
-        ("Partial", "completed"),
-        ("Canceled", "failed"),
-        ("Cancelled", "failed"),
-        ("Refunded", "failed"),
-        ("Error", "failed"),
-        ("WhoKnows", "failed"),
-    ],
-)
-async def test_ipgold_status_map(raw_status: str, expected: str) -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={"charge": "5.00", "status": raw_status, "remains": 0, "currency": "RUB"},
-        )
-
-    async with _make_client(handler) as http:
-        adapter = IpgoldAdapter("test_key", http)
-        assert await adapter.get_order_status("9001") == expected
-
-
-# --- defensive paths ---------------------------------------------------------
-
-
-async def test_ipgold_refuses_create_when_cost_exceeds_max() -> None:
-    """HIGH-c: estimate-first stops over-budget orders before /add is called."""
-    add_called = False
+async def test_ipgold_estimate_first_rejects_over_budget_before_create() -> None:
+    """HIGH-c: when cost exceeds spec.max_cost, neither create_campaign nor
+    refill_campaign is touched. The whole point: NO money risk.
+    """
+    create_called = False
+    refill_called = False
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal add_called
-        body = _body(request)
-        if body["action"] == "services":
-            return httpx.Response(200, json=_SERVICES_LIST)
-        if body["action"] == "add":
-            add_called = True
-            return httpx.Response(200, json={"order": 1})
-        return httpx.Response(404)
+        nonlocal create_called, refill_called
+        action = _body(request)["action"]
+        if action == "get_campaign_types":
+            return httpx.Response(200, json={"status": "OK", "results": _CAMPAIGN_TYPES})
+        if action == "create_campaign":
+            create_called = True
+        if action == "refill_campaign":
+            refill_called = True
+        return httpx.Response(200, json={"status": "OK", "results": {"id": 999, "type_id": 7}})
 
     async with _make_client(handler) as http:
         adapter = IpgoldAdapter("test_key", http)
         spec = OrderSpec(
             scenario=Scenario.ACTIVITY_SUBSCRIBE,
             exchange="ipgold",
-            target="https://t.me/test_canary",
-            quantity=10_000,  # 10000 * 0.05 = 500, way over the cap
-            service_id="1",
-            max_cost=10.0,
+            target="https://t.me/x",
+            quantity=100,  # 100 × 0.05 = 5.0
+            service_id="7",
+            max_cost=1.0,
         )
         with pytest.raises(ValueError, match=r"exceeds spec\.max_cost"):
             await adapter.create_order(spec, "uuid-1")
-        assert not add_called
+        assert not create_called
+        assert not refill_called
 
 
-async def test_ipgold_create_unknown_service_id() -> None:
+async def test_ipgold_create_order_unknown_type_id() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if _body(request)["action"] == "services":
-            return httpx.Response(200, json=_SERVICES_LIST)
+        if _body(request)["action"] == "get_campaign_types":
+            return httpx.Response(200, json={"status": "OK", "results": _CAMPAIGN_TYPES})
         return httpx.Response(500)
 
     async with _make_client(handler) as http:
@@ -199,50 +204,136 @@ async def test_ipgold_create_unknown_service_id() -> None:
             service_id="999",
             max_cost=10.0,
         )
-        with pytest.raises(ValueError, match="not in catalogue"):
+        with pytest.raises(ValueError, match="not in campaign-types catalogue"):
             await adapter.create_order(spec, "uuid-1")
 
 
-async def test_ipgold_access_denied_envelope_surfaces_clean_error() -> None:
-    """Real IPGold rejects with {status: BAD, errors: [...]}. The adapter
-    surfaces the API's own message rather than masking it — and never leaks
-    the api_key into the error string.
+async def test_ipgold_create_order_requires_numeric_service_id() -> None:
+    async with _make_client(lambda r: httpx.Response(500)) as http:
+        adapter = IpgoldAdapter("test_key", http)
+        spec = OrderSpec(
+            scenario=Scenario.ACTIVITY_SUBSCRIBE,
+            exchange="ipgold",
+            target="x",
+            quantity=10,
+            service_id="not-a-number",
+            max_cost=10.0,
+        )
+        with pytest.raises(ValueError, match="numeric"):
+            await adapter.create_order(spec, "uuid-1")
+
+
+async def test_ipgold_create_succeeds_but_refill_fails_surfaces_orphan() -> None:
+    """If step 2 (refill) fails after step 1 (create) succeeded, the campaign
+    is orphan on IPGold's side. The adapter MUST raise with the campaign id
+    in the message so an admin can recover from the web cabinet.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "status": "BAD",
-                "errors": [
-                    {"message": "Something is broken", "code": 0},
-                    {"message": "Access denied", "code": 403},
-                ],
-            },
-        )
+        action = _body(request)["action"]
+        if action == "get_campaign_types":
+            return httpx.Response(200, json={"status": "OK", "results": _CAMPAIGN_TYPES})
+        if action == "create_campaign":
+            return httpx.Response(
+                200, json={"status": "OK", "results": {"id": 7777, "type_id": 24}}
+            )
+        if action == "refill_campaign":
+            return httpx.Response(
+                400,
+                json={
+                    "status": "BAD",
+                    "errors": [{"message": "Insufficient funds", "code": 42}],
+                },
+            )
+        return httpx.Response(404)
 
     async with _make_client(handler) as http:
-        adapter = IpgoldAdapter("supersecret_ipgold_token", http)
+        adapter = IpgoldAdapter("test_key", http)
+        spec = OrderSpec(
+            scenario=Scenario.SOCIAL_TRAFFIC,
+            exchange="ipgold",
+            target="https://example.com",
+            quantity=10,
+            service_id="24",
+            max_cost=1.0,
+            source_platform=SourcePlatform.VK,
+        )
         with pytest.raises(RuntimeError) as exc:
-            await adapter.get_balance()
+            await adapter.create_order(spec, "uuid-1")
     msg = str(exc.value)
-    assert "Access denied" in msg
-    assert "code 403" in msg
-    assert "supersecret_ipgold_token" not in msg  # security: token not leaked
+    assert "7777" in msg  # campaign id surfaces for manual recovery
+    assert "Insufficient funds" in msg
 
 
-async def test_ipgold_http_400_with_envelope_parses_not_raises() -> None:
-    """IPGold returns the BAD-envelope with HTTP **400** (not 200) when auth
-    fails. The adapter must parse the body first and surface the API's own
-    message — calling `raise_for_status()` first would lose the diagnostic
-    and produce a generic 'Client error 400' instead.
+# --- get_order_status --------------------------------------------------------
 
-    Regression test for the bug found during live deploy 2026-05-26.
+
+@pytest.mark.parametrize(
+    "info, expected",
+    [
+        ({"moderation_status": "reject", "status": "start", "balance": 100}, "failed"),
+        ({"moderation_status": "wait", "status": "stop", "balance": 0}, "in_progress"),
+        ({"moderation_status": "success", "status": "stop", "balance": 50}, "failed"),
+        ({"moderation_status": "success", "status": "start", "balance": 100}, "in_progress"),
+        ({"moderation_status": "success", "status": "start", "balance": 0}, "completed"),
+    ],
+)
+async def test_ipgold_status_mapping(info: dict, expected: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = _body(request)
+        assert body["action"] == "get_campaign_info"
+        assert body["type_id"] == 24
+        assert body["id"] == 555111
+        return httpx.Response(200, json={"status": "OK", "results": info})
+
+    async with _make_client(handler) as http:
+        adapter = IpgoldAdapter("test_key", http)
+        assert await adapter.get_order_status("24:555111") == expected
+
+
+async def test_ipgold_status_malformed_external_id_is_failed() -> None:
+    """If external_order_id isn't in the `type_id:id` shape, treat as failed
+    (we can't recover; surface to caller cleanly)."""
+    async with _make_client(lambda r: httpx.Response(500)) as http:
+        adapter = IpgoldAdapter("test_key", http)
+        assert await adapter.get_order_status("just-a-number") == "failed"
+        assert await adapter.get_order_status("a:b") == "failed"
+
+
+# --- catalogue filter --------------------------------------------------------
+
+
+async def test_ipgold_list_services_for_scenario_filters_correctly() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if _body(request)["action"] == "get_campaign_types":
+            return httpx.Response(200, json={"status": "OK", "results": _CAMPAIGN_TYPES})
+        return httpx.Response(404)
+
+    async with _make_client(handler) as http:
+        adapter = IpgoldAdapter("test_key", http)
+        # ACTIVITY_SUBSCRIBE → "subscribe" / "подпис" → type 7
+        subs = await adapter.list_services_for_scenario(Scenario.ACTIVITY_SUBSCRIBE)
+        assert [s.service_id for s in subs] == ["7"]
+        # ACTIVITY_LIKE → "like" / "лайк" → type 11
+        likes = await adapter.list_services_for_scenario(Scenario.ACTIVITY_LIKE)
+        assert [s.service_id for s in likes] == ["11"]
+        # SOCIAL_TRAFFIC → "visit" / "трафик" → type 24 (simple site visit)
+        traffic = await adapter.list_services_for_scenario(Scenario.SOCIAL_TRAFFIC)
+        assert [s.service_id for s in traffic] == ["24"]
+
+
+# --- error envelope handling -------------------------------------------------
+
+
+async def test_ipgold_access_denied_envelope_surfaces_clean_error() -> None:
+    """Real IPGold returns {status: BAD, errors: [...]} on HTTP 403 when the
+    token is invalid or API isn't activated. Surface the message verbatim;
+    DON'T leak the api key.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            400,  # ← key part: 4xx + JSON envelope
+            403,
             json={
                 "status": "BAD",
                 "errors": [{"message": "Access denied", "code": 403}],
@@ -250,20 +341,55 @@ async def test_ipgold_http_400_with_envelope_parses_not_raises() -> None:
         )
 
     async with _make_client(handler) as http:
-        adapter = IpgoldAdapter("test_key", http)
+        adapter = IpgoldAdapter("supersecret_ipgold_token", http)
         with pytest.raises(RuntimeError) as exc:
-            await adapter.get_balance()
+            await adapter._get_campaign_types()
     msg = str(exc.value)
     assert "Access denied" in msg
     assert "code 403" in msg
-    # Must NOT be the generic httpx error.
-    assert "Client error" not in msg
+    assert "supersecret_ipgold_token" not in msg
 
 
-async def test_ipgold_http_500_non_json_falls_back_to_http_error() -> None:
-    """If the body isn't valid JSON, the adapter must surface the raw HTTP
-    error rather than mask it as a parse exception.
-    """
+async def test_ipgold_action_not_specified_envelope() -> None:
+    """API returns BAD/code 4 on missing action — we surface it cleanly."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "status": "BAD",
+                "errors": [{"message": "Action is not specified", "code": 4}],
+            },
+        )
+
+    async with _make_client(handler) as http:
+        adapter = IpgoldAdapter("test_key", http)
+        with pytest.raises(RuntimeError) as exc:
+            await adapter._get_campaign_types()
+    assert "Action is not specified" in str(exc.value)
+
+
+async def test_ipgold_rate_limit_429_envelope() -> None:
+    """API returns BAD/code 429 on rate limits — surfaces cleanly."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={
+                "status": "BAD",
+                "errors": [{"message": "You have exceeded the request limit", "code": 429}],
+            },
+        )
+
+    async with _make_client(handler) as http:
+        adapter = IpgoldAdapter("test_key", http)
+        with pytest.raises(RuntimeError) as exc:
+            await adapter._get_campaign_types()
+    assert "exceeded the request limit" in str(exc.value)
+
+
+async def test_ipgold_http_5xx_non_json_falls_back_to_http_error() -> None:
+    """Non-JSON 5xx body → fallback to httpx HTTP error."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="<html>Internal Server Error</html>")
@@ -271,32 +397,5 @@ async def test_ipgold_http_500_non_json_falls_back_to_http_error() -> None:
     async with _make_client(handler) as http:
         adapter = IpgoldAdapter("test_key", http)
         with pytest.raises(Exception) as exc:
-            await adapter.get_balance()
-    # Either httpx.HTTPStatusError or our RuntimeError — both acceptable.
+            await adapter._get_campaign_types()
     assert "500" in str(exc.value) or "Server error" in str(exc.value)
-
-
-# --- catalogue filter --------------------------------------------------------
-
-
-async def test_ipgold_list_services_for_scenario_filters_by_name() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        if _body(request)["action"] == "services":
-            return httpx.Response(200, json=_SERVICES_LIST)
-        return httpx.Response(404)
-
-    async with _make_client(handler) as http:
-        adapter = IpgoldAdapter("test_key", http)
-        # ACTIVITY_SUBSCRIBE → "подпис..." → "Подписчики Telegram"
-        subs = await adapter.list_services_for_scenario(Scenario.ACTIVITY_SUBSCRIBE)
-        assert len(subs) == 1
-        assert subs[0].service_id == "1"
-        assert "Подписчики" in subs[0].name
-        # ACTIVITY_LIKE → "лайк..." → "Лайки YouTube"
-        likes = await adapter.list_services_for_scenario(Scenario.ACTIVITY_LIKE)
-        assert len(likes) == 1
-        assert likes[0].service_id == "2"
-        # SOCIAL_TRAFFIC → "переход..." → "Переходы..."
-        traffic = await adapter.list_services_for_scenario(Scenario.SOCIAL_TRAFFIC)
-        assert len(traffic) == 1
-        assert traffic[0].service_id == "3"

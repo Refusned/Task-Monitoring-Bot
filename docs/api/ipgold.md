@@ -1,73 +1,83 @@
-# ipgold.ru — Advertiser API (reference)
+# ipgold.ru — Advertiser API v1 (reference)
 
-**Endpoint:** `https://ipgold.ru/api/v2`
-**Format:** POST form-encoded, JSON responses.
-**Auth:** body param `api_key`.
-
-## Confirmed shape (probed live 2026-05-26)
+**Source of truth:** official OpenAPI 1.1.7 spec ([api_docs](https://ipgold.ru/api_docs)).
 
 | Aspect | Value |
 |---|---|
+| Base URL | `https://ipgold.ru/api/v1/` (or `https://ipgold.biz/api/v1/`) |
 | Method | `POST` |
-| Endpoint | `https://ipgold.ru/api/v2` |
-| Action selector | body param `action=<name>` |
-| Auth | body param `api_key=<token>` |
-| Success envelope | `{"status": "OK", ...payload}` |
-| Error envelope | `{"status": "BAD", "errors": [{"message": "...", "code": <int>}, ...]}` |
+| Path | `/api/v1/<action>` *or* `/api/v1/` with `action` body param |
+| Body | JSON, `Content-Type: application/json` |
+| Auth | body param `key` = personal API token |
+| Action | body param `action` = method name (required) |
+| Success | `{"status": "OK", "results": ...}` |
+| Error | `{"status": "BAD", "errors": [{"message": ..., "code": ...}, ...]}` |
 
-This matches the **Perfect Panel** reseller API form, the same family as
-`smmcode.shop` and `prskill.ru`. The adapter implementation models that shape.
+Errors are returned with HTTP status codes **200**, **400**, **403**, **429**
+all carrying the BAD envelope. The adapter parses the body BEFORE
+`raise_for_status` so the API's own message reaches the operator (e.g.
+`Access denied (code 403)`, `Insufficient funds (code 42)`).
 
-## Known actions (Perfect Panel convention)
+## Domain model: campaigns, not orders
 
-| Action | Required params | Returns |
+IPGold's primitive is the **advertising campaign**, not a one-shot SMM order:
+
+| Phase | Action | Money? |
 |---|---|---|
-| `balance` | — | `{balance: float, currency: str}` |
-| `services` | — | array of `{service, name, type, category, rate, min, max, ...}` |
-| `add` | `service`, `link`, `quantity` | `{order: int}` |
-| `status` | `order` | `{charge, start_count, status, remains, currency}` |
+| Catalogue | `get_campaign_types` | no |
+| Create | `create_campaign(type_id, url, actions_per_day)` | no |
+| Fund | `refill_campaign(type_id, id, actions_number)` | **YES** |
+| Run | `start_campaign` / `stop_campaign` | no |
+| Inspect | `get_campaign_info`, `get_campaign_info_list`, `get_campaign_stat` | no |
+| Configure | `change_campaign(targeting, regularity, ...)` | no |
 
-`rate` is per **1000** units (Perfect Panel convention); the adapter divides by
-1000 to compute per-unit price for the estimate-first cost cap.
+The bot maps each Telegram-side "order" → one IPGold campaign whose lifetime
+balance equals `spec.quantity` executions. The two-step flow
+(create → refill) is wrapped inside our adapter's `create_order`. If create
+succeeds but refill fails, the adapter surfaces the orphan campaign id so an
+admin can recover via the web cabinet.
+
+## External order id encoding
+
+IPGold's campaign-info methods require **both** `type_id` and `id`. Our
+domain model exposes a single `external_order_id` string per order, so the
+adapter encodes both as `"<type_id>:<id>"` (e.g. `"24:555111"`). The
+`get_order_status` method splits it back.
+
+## Status mapping
+
+| IPGold tuple | Normalised |
+|---|---|
+| `moderation_status="reject"` | `failed` |
+| `moderation_status="wait"`   | `in_progress` |
+| `moderation_status="success" + status="stop"` | `failed` |
+| `moderation_status="success" + status="start" + balance>0` | `in_progress` |
+| `moderation_status="success" + status="start" + balance==0` | `completed` |
+
+## Why no account balance
+
+`get_balance` is **NOT** part of the Advertiser API. Account balance only
+surfaces via `refill_campaign` (which fails with error code 42 "Insufficient
+funds" if exhausted) or via the web cabinet. The adapter omits
+`Capability.GET_BALANCE` from `capabilities()` so the bot's `/balance`
+honestly shows "баланс не отдаётся API" (consistent with advego).
 
 ## Known error codes
 
-| code | meaning |
-|---|---|
-| 0 | Generic "Something is broken" wrapper. Usually accompanies another error. |
-| 4 | `Action is not specified` — the `action` body param missing. |
-| 403 | `Access denied` — see "Activation" below. |
-
-## Activation
-
-The personal API key must be **explicitly activated** in the user's IPGold
-account before any action returns OK. Until activation:
-
-- **Every** authenticated request returns `{"status": "BAD", "errors": [{"message": "Access denied", "code": 403}, ...]}`.
-- This is independent of the action requested.
-
-To enable the API for an account, the user must:
-
-1. Sign in at https://ipgold.ru/
-2. Navigate to the advertiser-side API docs page: https://ipgold.ru/api_docs
-3. Enable API access on the profile / settings page (IPGold's UI; not via API).
-4. *(On some plans)* whitelist the calling IP address. Check `2.26.110.148` is allowed if running from the bot's deployment.
-
-After activation, the same `api_key` will start receiving `OK` envelopes.
-
-## Adapter status
-
-- `IpgoldAdapter` is a **PanelAdapter** (prepaid lifecycle, no per-submission
-  accept/reject).
-- Capabilities: `CREATE_ORDER`, `GET_ORDER_STATUS`, `GET_BALANCE`.
-- Estimate-first cost cap enforced via cached `services` lookup before `/add`
-  is called — same money-safety pattern as smmcode/prskill.
-- The adapter surfaces IPGold's own error messages verbatim into `/balance` and
-  `/health`, so the bot operator can immediately see why a call was rejected
-  (typically: API not activated).
+| code | meaning | mitigation |
+|---|---|---|
+| 0 | "Something is broken" (generic wrapper) | check accompanying errors |
+| 4 | `Action is not specified` | always pass `action` param |
+| 20 | `Unknown campaign type` | refresh `get_campaign_types` catalogue |
+| 42 | `Insufficient funds in the account balance` | top up via web cabinet |
+| 57 | `The *sex* field only accepts: 0, 1, 2` | (targeting; not currently used) |
+| 80 | `Could not find a campaign with this type and ID` | verify `type_id`+`id` pair |
+| 403 | `Access denied` | check API is activated in the account |
+| 429 | `You have exceeded the request limit` | back off |
 
 ## Notes
 
-- API tokens are read from `.env` (`IPGOLD_API_KEY`); never committed.
-- The adapter's `_post` strips `api_key` from any error echo so it can't leak
-  into bot replies, logs, or audit entries.
+- API tokens (`IPGOLD_API_KEY`) are read from `.env`; never committed.
+- The adapter's `_post` strips `key` from any error echo so it can't leak.
+- Prices in `get_campaign_types` are returned as **strings** (e.g. `"0.00015"`).
+  Estimate-first cost cap converts to float and refuses if `price * quantity > spec.max_cost`.
