@@ -141,6 +141,7 @@ async def main() -> None:
                     BotCommand(command="start", description="Главное меню"),
                     BotCommand(command="menu", description="Показать меню"),
                     BotCommand(command="new_order", description="📦 Новый заказ"),
+                    BotCommand(command="balance", description="💰 Баланс бирж"),
                     BotCommand(command="dashboard", description="📊 Сводка"),
                     BotCommand(command="orders", description="📋 Активные заказы"),
                     BotCommand(command="check", description="🔎 Запустить проверку"),

@@ -33,6 +33,7 @@ from models import Scenario, SourcePlatform
 
 # Labels for the persistent Reply keyboard.
 BTN_NEW_ORDER = "📦 Новый заказ"
+BTN_BALANCE = "💰 Баланс"
 BTN_DASHBOARD = "📊 Сводка"
 BTN_ORDERS = "📋 Заказы"
 BTN_CHECK = "🔎 Проверить"
@@ -47,13 +48,18 @@ TASK_EXCHANGES = ("unu", "advego", "ipgold")
 
 
 def main_menu() -> ReplyKeyboardMarkup:
-    """Persistent menu always visible under the input field."""
+    """Persistent menu always visible under the input field.
+
+    Layout — money-relevant actions (Новый заказ, Баланс) are on the top row
+    where they're easiest to reach with the thumb.
+    """
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=BTN_NEW_ORDER), KeyboardButton(text=BTN_DASHBOARD)],
-            [KeyboardButton(text=BTN_ORDERS), KeyboardButton(text=BTN_CHECK)],
-            [KeyboardButton(text=BTN_REVIEW), KeyboardButton(text=BTN_REPORT)],
-            [KeyboardButton(text=BTN_HEALTH), KeyboardButton(text=BTN_CANCEL)],
+            [KeyboardButton(text=BTN_NEW_ORDER), KeyboardButton(text=BTN_BALANCE)],
+            [KeyboardButton(text=BTN_DASHBOARD), KeyboardButton(text=BTN_ORDERS)],
+            [KeyboardButton(text=BTN_CHECK), KeyboardButton(text=BTN_REVIEW)],
+            [KeyboardButton(text=BTN_REPORT), KeyboardButton(text=BTN_HEALTH)],
+            [KeyboardButton(text=BTN_CANCEL)],
         ],
         resize_keyboard=True,
         is_persistent=True,

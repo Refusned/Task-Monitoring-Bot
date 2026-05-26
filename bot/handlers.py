@@ -27,6 +27,7 @@ from aiogram.types import CallbackQuery, Message
 
 from bot import keyboards
 from bot.keyboards import (
+    BTN_BALANCE,
     BTN_CANCEL,
     BTN_CHECK,
     BTN_DASHBOARD,
@@ -172,6 +173,18 @@ async def reply_new_order(
     **kwargs: Any,
 ) -> None:
     await _start_new_order(message, state)
+
+
+@router.message(F.text == BTN_BALANCE)
+@_require_admin_msg
+async def reply_balance(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    **kwargs: Any,
+) -> None:
+    await state.clear()
+    await _show_balance(message, settings)
 
 
 @router.message(F.text == BTN_DASHBOARD)
@@ -1114,6 +1127,74 @@ async def cmd_health(
     **kwargs: Any,
 ) -> None:
     await _show_health(message, settings)
+
+
+# ---------------------------------------------------------------------------
+# /balance — query each configured exchange's live balance.
+# ---------------------------------------------------------------------------
+
+
+# Money-relevant exchanges + the .env key the user must populate. The order is
+# the order shown in the bot reply — keep panels first, then task-exchanges.
+_BALANCE_EXCHANGES: tuple[tuple[str, str], ...] = (
+    ("smmcode", "SMMCODE_API_KEY"),
+    ("prskill", "PRSKILL_API_KEY"),
+    ("unu", "UNU_API_KEY"),
+    ("advego", "ADVEGO_API_TOKEN"),
+    ("ipgold", "IPGOLD_API_KEY"),
+)
+
+
+async def _show_balance(message: Message, settings: Settings) -> None:
+    """Show live balance on every configured exchange.
+
+    Errors are surfaced per-exchange — a network blip on one shouldn't hide the
+    balance of the others. Adapters that don't expose a public balance API
+    (advego, ipgold-stub) are flagged honestly via capabilities() rather than
+    pretending with a fake `0.00`.
+    """
+    # Local imports to avoid coupling the module's top-level with the adapter
+    # layer (handlers.py is already heavy).
+    from adapters.base import Capability
+    from cli import build_adapter
+
+    lines = ["💰 *Балансы бирж*"]
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as http_client:
+        for name, env_key in _BALANCE_EXCHANGES:
+            try:
+                adapter = build_adapter(settings, name, http_client, dry_run=settings.dry_run)
+            except ValueError:
+                lines.append(f"⚪ `{name}` — ключ `{env_key}` не задан")
+                continue
+            except Exception as exc:
+                lines.append(f"❌ `{name}` — ошибка инициализации: {exc}")
+                continue
+
+            if Capability.GET_BALANCE not in adapter.capabilities():
+                lines.append(f"➖ `{name}` — баланс не отдаётся публичным API")
+                continue
+
+            try:
+                balance = await adapter.get_balance()
+                lines.append(f"✅ `{name}` — *{balance:.2f}* ₽")
+            except Exception as exc:
+                # Per-exchange error: don't leak the api key in error text.
+                short = f"{type(exc).__name__}: {exc}"[:120]
+                lines.append(f"❌ `{name}` — {short}")
+
+    lines.append(f"\nРежим: *{'DRY_RUN' if settings.dry_run else 'LIVE'}*")
+    await message.answer("\n".join(lines), parse_mode="Markdown")
+
+
+@router.message(Command("balance"))
+@_require_admin_msg
+async def cmd_balance(
+    message: Message,
+    _state: FSMContext,
+    settings: Settings,
+    **kwargs: Any,
+) -> None:
+    await _show_balance(message, settings)
 
 
 # ---------------------------------------------------------------------------

@@ -119,11 +119,12 @@ async def test_start_shows_main_menu_and_clears_state(
     assert len(msg.answers) == 1
     text, kb = msg.answers[0]
     assert "Бот мониторинга бирж" in text
-    # Reply keyboard is attached and contains the 8 main-menu buttons.
+    # Reply keyboard is attached and contains all 9 main-menu buttons.
     assert kb is not None
     labels = {btn.text for row in kb.keyboard for btn in row}
     for expected in (
         keyboards.BTN_NEW_ORDER,
+        keyboards.BTN_BALANCE,
         keyboards.BTN_DASHBOARD,
         keyboards.BTN_ORDERS,
         keyboards.BTN_CHECK,
@@ -135,6 +136,57 @@ async def test_start_shows_main_menu_and_clears_state(
         assert expected in labels
     # FSM cleared.
     assert await state.get_state() is None
+
+
+async def test_reply_balance_handler(state: FSMContext, settings: Settings) -> None:
+    """Tapping 💰 Баланс triggers the balance handler. Without API keys
+    configured (test fixture), each exchange surfaces "ключ не задан" instead
+    of crashing the whole answer.
+    """
+    msg = _FakeMessage(keyboards.BTN_BALANCE)
+    await handlers.reply_balance(msg, state, settings=settings)
+    assert msg.answers, "balance handler must produce at least one reply"
+    text, _ = msg.answers[-1]
+    assert "Балансы бирж" in text
+    # All five exchanges enumerated in the reply (even if just as "key missing").
+    for name in ("smmcode", "prskill", "unu", "advego", "ipgold"):
+        assert name in text
+    # FSM cleared by the handler.
+    assert await state.get_state() is None
+
+
+async def test_reply_balance_with_one_configured_key(
+    state: FSMContext, settings: Settings, monkeypatch
+) -> None:
+    """If a single exchange has a key set, its balance line shows a value (or
+    a clean error) — other exchanges still surface "ключ не задан".
+    """
+    settings = settings.model_copy(update={"smmcode_api_key": "test-key"})
+
+    # Stub the adapter so we don't hit the real network during this test.
+    async def fake_balance(self) -> float:
+        return 1349.06
+
+    from adapters.smmcode import SmmcodeAdapter
+
+    monkeypatch.setattr(SmmcodeAdapter, "get_balance", fake_balance)
+
+    msg = _FakeMessage(keyboards.BTN_BALANCE)
+    await handlers.reply_balance(msg, state, settings=settings)
+    text, _ = msg.answers[-1]
+    assert "smmcode" in text
+    assert "1349.06" in text  # rendered with 2 decimals
+    # Exchanges with no key are still listed cleanly.
+    assert "prskill" in text and "не задан" in text
+
+
+async def test_balance_command_alias(state: FSMContext, settings: Settings) -> None:
+    """The slash-command `/balance` reaches the same handler as the button."""
+    msg = _FakeMessage("/balance")
+    await handlers.cmd_balance(msg, state, settings=settings)
+    assert msg.answers
+    text, _ = msg.answers[-1]
+    assert "Балансы бирж" in text
 
 
 async def test_menu_clears_state_and_shows_keyboard(state: FSMContext, settings: Settings) -> None:
@@ -438,11 +490,22 @@ async def test_accept_callback_admin_calls_decide(monkeypatch, settings: Setting
 
 
 def test_main_menu_keyboard_layout() -> None:
+    """Main menu has 9 buttons across 5 rows: 4 pairs + a final single-button
+    row for Cancel. Money-relevant actions (Новый заказ, Баланс) are pinned to
+    the top row.
+    """
     kb = keyboards.main_menu()
-    # 4 rows × 2 buttons.
-    assert len(kb.keyboard) == 4
-    for row in kb.keyboard:
+    assert len(kb.keyboard) == 5
+    # First four rows are pairs.
+    for row in kb.keyboard[:4]:
         assert len(row) == 2
+    # Last row is the single Cancel button.
+    assert len(kb.keyboard[-1]) == 1
+    assert kb.keyboard[-1][0].text == keyboards.BTN_CANCEL
+    # Top row holds the money-relevant actions.
+    top_row_labels = {btn.text for btn in kb.keyboard[0]}
+    assert keyboards.BTN_NEW_ORDER in top_row_labels
+    assert keyboards.BTN_BALANCE in top_row_labels
 
 
 def test_scenario_choice_keyboard_has_three_choices_plus_cancel() -> None:
