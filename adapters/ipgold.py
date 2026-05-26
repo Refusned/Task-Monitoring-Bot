@@ -172,11 +172,27 @@ class IpgoldAdapter(PanelAdapter):
         We surface the first error message verbatim so the operator sees
         exactly why the API rejected the call (typical reasons: "Access
         denied" 403 when API isn't activated; "Action is not specified" 4).
+
+        IPGold uses HTTP **400** for the rejected-but-structured response,
+        not 200 — so we DO NOT call `raise_for_status()` first. We try the
+        envelope parse and only fall back to a raw HTTP error if the body
+        isn't the expected JSON.
         """
         body = {"api_key": self._api_key, **params}
         response = await self._client.post(_BASE_URL, data=body)
-        response.raise_for_status()
-        payload = response.json()
+
+        # IPGold returns HTTP 400 for "BAD" envelope responses. Try JSON
+        # parse first; only raise on raw HTTP errors if the body isn't a
+        # parseable envelope.
+        try:
+            payload = response.json()
+        except Exception as exc:
+            response.raise_for_status()
+            raise RuntimeError(
+                f"ipgold {params.get('action')!r}: HTTP {response.status_code} "
+                f"with non-JSON body: {response.text[:120]!r}"
+            ) from exc
+
         if isinstance(payload, dict) and payload.get("status") == "BAD":
             errors = payload.get("errors") or []
             msgs = ", ".join(
@@ -185,6 +201,11 @@ class IpgoldAdapter(PanelAdapter):
                 if isinstance(e, dict)
             )
             raise RuntimeError(f"ipgold {params.get('action')!r} rejected: {msgs or payload!r}")
+
+        # Defensive: any other 4xx/5xx with parseable JSON but no `status` key.
+        if response.status_code >= 400:
+            response.raise_for_status()
+
         return payload
 
     async def _service_rate(self, service_id: str) -> float:

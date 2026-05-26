@@ -231,6 +231,51 @@ async def test_ipgold_access_denied_envelope_surfaces_clean_error() -> None:
     assert "supersecret_ipgold_token" not in msg  # security: token not leaked
 
 
+async def test_ipgold_http_400_with_envelope_parses_not_raises() -> None:
+    """IPGold returns the BAD-envelope with HTTP **400** (not 200) when auth
+    fails. The adapter must parse the body first and surface the API's own
+    message — calling `raise_for_status()` first would lose the diagnostic
+    and produce a generic 'Client error 400' instead.
+
+    Regression test for the bug found during live deploy 2026-05-26.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,  # ← key part: 4xx + JSON envelope
+            json={
+                "status": "BAD",
+                "errors": [{"message": "Access denied", "code": 403}],
+            },
+        )
+
+    async with _make_client(handler) as http:
+        adapter = IpgoldAdapter("test_key", http)
+        with pytest.raises(RuntimeError) as exc:
+            await adapter.get_balance()
+    msg = str(exc.value)
+    assert "Access denied" in msg
+    assert "code 403" in msg
+    # Must NOT be the generic httpx error.
+    assert "Client error" not in msg
+
+
+async def test_ipgold_http_500_non_json_falls_back_to_http_error() -> None:
+    """If the body isn't valid JSON, the adapter must surface the raw HTTP
+    error rather than mask it as a parse exception.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="<html>Internal Server Error</html>")
+
+    async with _make_client(handler) as http:
+        adapter = IpgoldAdapter("test_key", http)
+        with pytest.raises(Exception) as exc:
+            await adapter.get_balance()
+    # Either httpx.HTTPStatusError or our RuntimeError — both acceptable.
+    assert "500" in str(exc.value) or "Server error" in str(exc.value)
+
+
 # --- catalogue filter --------------------------------------------------------
 
 
