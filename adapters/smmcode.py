@@ -24,8 +24,8 @@ from typing import Any
 
 import httpx
 
-from adapters.base import Capability, PanelAdapter
-from models import OrderSpec
+from adapters.base import Capability, PanelAdapter, ServiceOption, keywords_for_scenario
+from models import OrderSpec, Scenario
 
 _BASE_URL = "https://smmcode.shop/api/reseller"
 _SERVICES_TTL_SECONDS = 300.0
@@ -115,6 +115,51 @@ class SmmcodeAdapter(PanelAdapter):
             safe_payload = {k: v for k, v in payload.items() if k != "api_token"}
             raise RuntimeError(f"smmcode {method} returned non-200 status: {safe_payload!r}")
         return payload
+
+    async def list_services_for_scenario(
+        self,
+        scenario: Scenario,
+        limit: int = 8,
+    ) -> list[ServiceOption]:
+        """Filter the cached `/services` catalogue by name keywords matching the
+        scenario. Sorted by price-per-unit ascending so the cheapest choice is
+        on top (typical demo flow wants the cheapest viable option).
+        """
+        services = await self._get_services()
+        keywords = keywords_for_scenario(scenario)
+        if not keywords:
+            return []
+        candidates: list[ServiceOption] = []
+        for svc in services.values():
+            name = str(svc.get("name", ""))
+            haystack = name.lower()
+            if not any(kw in haystack for kw in keywords):
+                continue
+            try:
+                price = float(svc.get("price", 0))
+            except (TypeError, ValueError):
+                price = 0.0
+            if price <= 0:
+                continue  # skip entries we can't cost-cap reliably
+            try:
+                min_q = int(svc.get("min", 0)) or None
+            except (TypeError, ValueError):
+                min_q = None
+            try:
+                max_q = int(svc.get("max", 0)) or None
+            except (TypeError, ValueError):
+                max_q = None
+            candidates.append(
+                ServiceOption(
+                    service_id=str(svc.get("service_id", svc.get("id", ""))),
+                    name=name,
+                    price_per_unit=price,
+                    min_quantity=min_q,
+                    max_quantity=max_q,
+                )
+            )
+        candidates.sort(key=lambda s: (s.price_per_unit or 0.0, s.name))
+        return candidates[:limit]
 
     async def _service_price(self, service_id: str) -> float:
         services = await self._get_services()

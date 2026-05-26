@@ -84,7 +84,7 @@ async def check_accounts(
     settings: Settings, http_client: httpx.AsyncClient
 ) -> list[dict[str, str]]:
     """Poll all configured social accounts and return any newly detected posts."""
-    state = _load_state()
+    state = await _load_state_from_db(settings)
     new_posts: list[dict[str, str]] = []
 
     for url in settings.target_social_accounts:
@@ -106,7 +106,7 @@ async def check_accounts(
             )
         state[url] = current_id
 
-    _save_state(state)
+    await _save_state_to_db(settings, state)
     return new_posts
 
 
@@ -124,6 +124,8 @@ async def run_once(
     settings: Settings, *, notify_callback: Any | None = None
 ) -> list[dict[str, str]]:
     """Single pass of the watcher. Returns list of newly detected posts."""
+    if not settings.target_social_accounts:
+        return []
     async with httpx.AsyncClient() as http_client:
         new_posts = await check_accounts(settings, http_client)
 
@@ -141,3 +143,23 @@ async def run_once(
                 await notify_callback(post)
 
     return new_posts
+
+
+async def _load_state_from_db(settings: Settings) -> dict[str, str]:
+    async with connect(settings) as conn:
+        cursor = await conn.execute("SELECT account_url, last_post_id FROM watcher_state")
+        rows = await cursor.fetchall()
+    return {row["account_url"]: row["last_post_id"] for row in rows}
+
+
+async def _save_state_to_db(settings: Settings, state: dict[str, str]) -> None:
+    async with connect(settings) as conn:
+        for account_url, last_post_id in state.items():
+            await conn.execute(
+                "INSERT INTO watcher_state (account_url, last_post_id, updated_at) "
+                "VALUES (?, ?, datetime('now')) "
+                "ON CONFLICT(account_url) DO UPDATE SET "
+                "last_post_id = excluded.last_post_id, updated_at = excluded.updated_at",
+                (account_url, last_post_id),
+            )
+        await conn.commit()

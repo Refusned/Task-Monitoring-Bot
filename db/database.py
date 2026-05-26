@@ -227,6 +227,204 @@ async def insert_submission(
     await conn.commit()
 
 
+async def get_submission_by_external(
+    conn: aiosqlite.Connection,
+    order_uuid: str,
+    external_submission_id: str,
+) -> Submission | None:
+    cursor = await conn.execute(
+        """
+        SELECT * FROM submissions
+        WHERE order_uuid = ? AND external_submission_id = ?
+        """,
+        (order_uuid, external_submission_id),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    return Submission(
+        submission_uuid=row["submission_uuid"],
+        order_uuid=row["order_uuid"],
+        external_submission_id=row["external_submission_id"],
+        executor_hint=row["executor_hint"],
+        status=SubmissionStatus(row["status"]),
+        evidence=row["evidence"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+async def ensure_submission_persisted(
+    conn: aiosqlite.Connection,
+    candidate: Submission,
+) -> tuple[Submission, bool]:
+    """Day 3 audit CRITICAL-1 fix: race-safe persistence of a submission.
+
+    Uses INSERT OR IGNORE against the `uq_submissions_order_external` partial
+    unique index, then re-fetches to return the canonical row. Two concurrent
+    pollers converge on a single local submission_uuid for the same external id.
+
+    Returns (canonical_submission, inserted_now). `inserted_now=False` means
+    another caller persisted this submission first; we use the existing row.
+
+    Submissions without an external_submission_id can't be deduplicated and
+    fall back to a plain insert.
+    """
+    if candidate.external_submission_id is None:
+        await insert_submission(conn, candidate)
+        return candidate, True
+
+    iso = candidate.created_at.isoformat(timespec="seconds")
+    cursor = await conn.execute(
+        """
+        INSERT OR IGNORE INTO submissions (
+            submission_uuid, order_uuid, external_submission_id, executor_hint,
+            status, evidence, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            candidate.submission_uuid,
+            candidate.order_uuid,
+            candidate.external_submission_id,
+            candidate.executor_hint,
+            candidate.status.value,
+            candidate.evidence,
+            iso,
+            iso,
+        ),
+    )
+    inserted_now = cursor.rowcount == 1
+    await conn.commit()
+
+    canonical = await get_submission_by_external(
+        conn, candidate.order_uuid, candidate.external_submission_id
+    )
+    if canonical is None:
+        raise RuntimeError(
+            f"ensure_submission_persisted: re-fetch failed for "
+            f"order={candidate.order_uuid!r} "
+            f"external={candidate.external_submission_id!r}"
+        )
+    return canonical, inserted_now
+
+
+async def claim_submission_action(
+    conn: aiosqlite.Connection,
+    submission_uuid: str,
+    *,
+    target: SubmissionStatus,
+    allowed_from: tuple[SubmissionStatus, ...],
+) -> bool:
+    """Day 3 audit CRITICAL-2 fix: conditional UPDATE for status transitions.
+
+    Returns True iff the claim succeeded (rowcount == 1). Transitions the
+    submission to `target` only when its current status is one of
+    `allowed_from`. The thread that gets True is the unique owner of the
+    subsequent action; losers receive False and must skip.
+    """
+    placeholders = ",".join("?" for _ in allowed_from)
+    cursor = await conn.execute(
+        f"""
+        UPDATE submissions SET status = ?, updated_at = ?
+        WHERE submission_uuid = ? AND status IN ({placeholders})
+        """,
+        (
+            target.value,
+            _now_iso(),
+            submission_uuid,
+            *[s.value for s in allowed_from],
+        ),
+    )
+    await conn.commit()
+    return cursor.rowcount == 1
+
+
+async def claim_submission_and_open_action(
+    conn: aiosqlite.Connection,
+    submission_uuid: str,
+    *,
+    target: SubmissionStatus,
+    allowed_from: tuple[SubmissionStatus, ...],
+    action_uuid: str,
+    action: str,
+    order_uuid: str | None,
+) -> bool:
+    """Day 3 audit HIGH-3 fix: claim + action_log open in a SINGLE transaction.
+
+    A separate conditional UPDATE followed by an `action_log` INSERT left a
+    crash window where the submission was `ACCEPTING`/`REJECTING` but no
+    matching action_log row existed (broken atomicity → orphan in-flight
+    records). This helper commits both rows together.
+
+    Returns True iff the claim succeeded.
+    """
+    now = _now_iso()
+    placeholders = ",".join("?" for _ in allowed_from)
+    cursor = await conn.execute(
+        f"""
+        UPDATE submissions SET status = ?, updated_at = ?
+        WHERE submission_uuid = ? AND status IN ({placeholders})
+        """,
+        (target.value, now, submission_uuid, *[s.value for s in allowed_from]),
+    )
+    if cursor.rowcount != 1:
+        # Claim lost; no action_log row. No commit needed (no changes).
+        return False
+    await conn.execute(
+        """
+        INSERT INTO action_log
+        (action_uuid, submission_uuid, order_uuid, action, state, started_at)
+        VALUES (?, ?, ?, ?, 'in_progress', ?)
+        """,
+        (action_uuid, submission_uuid, order_uuid, action, now),
+    )
+    await conn.commit()
+    return True
+
+
+async def count_non_terminal_submissions_for_order(
+    conn: aiosqlite.Connection, order_uuid: str
+) -> int:
+    """Day 3 audit HIGH-5 helper: number of submissions for an order that are
+    NOT in a terminal state (ACCEPTED / REWORK_REQUESTED / FAILED).
+
+    Used by the order-finalization branch to keep a task-exchange order in
+    VERIFYING while any submission still awaits admin or is mid-action.
+    """
+    cursor = await conn.execute(
+        """
+        SELECT COUNT(*) AS c FROM submissions
+        WHERE order_uuid = ? AND status NOT IN (?, ?, ?)
+        """,
+        (
+            order_uuid,
+            SubmissionStatus.ACCEPTED.value,
+            SubmissionStatus.REWORK_REQUESTED.value,
+            SubmissionStatus.FAILED.value,
+        ),
+    )
+    row = await cursor.fetchone()
+    return int(row["c"]) if row else 0
+
+
+async def list_order_uuids_in_status_older_than(
+    conn: aiosqlite.Connection,
+    status: OrderStatus,
+    cutoff_iso: str,
+) -> list[str]:
+    """Day 3 audit HIGH-4 helper: orders in `status` with `created_at <= cutoff_iso`.
+
+    Used by `reconcile_creating` to skip orders that may still be in flight
+    (their creator just hasn't reached `mark_order_active` yet). The `<=`
+    boundary lets `min_age_seconds=0` match rows created at-or-before now,
+    which is the intuitive meaning for tests; production callers pass 300+.
+    """
+    cursor = await conn.execute(
+        "SELECT client_order_uuid FROM orders WHERE status = ? AND created_at <= ?",
+        (status.value, cutoff_iso),
+    )
+    return [row["client_order_uuid"] for row in await cursor.fetchall()]
+
+
 async def get_submissions_for_order(
     conn: aiosqlite.Connection, order_uuid: str
 ) -> list[Submission]:
@@ -246,6 +444,27 @@ async def get_submissions_for_order(
             )
         )
     return result
+
+
+async def get_submission(
+    conn: aiosqlite.Connection,
+    submission_uuid: str,
+) -> Submission | None:
+    cursor = await conn.execute(
+        "SELECT * FROM submissions WHERE submission_uuid = ?", (submission_uuid,)
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    return Submission(
+        submission_uuid=row["submission_uuid"],
+        order_uuid=row["order_uuid"],
+        external_submission_id=row["external_submission_id"],
+        executor_hint=row["executor_hint"],
+        status=SubmissionStatus(row["status"]),
+        evidence=row["evidence"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+    )
 
 
 async def update_submission_status(

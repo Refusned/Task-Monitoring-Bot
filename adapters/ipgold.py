@@ -12,8 +12,7 @@ Expected API pattern (hypothesised):
 - Actions: `create_order`, `order_status`, `list_submissions`, `accept`, `reject`.
 
 Until confirmed, `get_balance` returns 0.0 with a warning, and `create_order`
-raises `RuntimeError` in live mode to prevent accidental placement. In DRY_RUN
-mode the fake task-exchange adapter is used instead (see `cli.py` `build_adapter`).
+raises `RuntimeError` to prevent accidental placement until the write API is verified.
 
 Docs reference: `docs/api/ipgold.md`.
 """
@@ -70,7 +69,7 @@ class IpgoldAdapter(TaskExchangeAdapter):
         # Prevent accidental live placement when API is unconfirmed.
         raise RuntimeError(
             "ipgold adapter is provisional: real API endpoints are not confirmed. "
-            "Use DRY_RUN mode (routes to FakeTaskExchangeAdapter) for testing."
+            "Create-order support for ipgold needs confirmed live API docs before use."
         )
 
     async def get_order_status(self, external_order_id: str) -> str:

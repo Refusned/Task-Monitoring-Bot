@@ -1,9 +1,9 @@
 """CLI entry point.
 
 Commands:
-- `smoke` (Day 1) - wiring check on fake adapters.
+- `smoke` (Day 1) - wiring check for config and database.
 - `create-order` (Day 2) - place an order on the chosen exchange.
-- `demo` (Day 3+) - full DRY_RUN lifecycle: create + poll + verify.
+- `demo` (Day 3+) - disabled since simulated exchanges were removed.
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from pydantic import ValidationError
 
 from adapters.advego import AdvegoAdapter
 from adapters.base import ExchangeAdapter, PanelAdapter, TaskExchangeAdapter
-from adapters.fake import FakePanelAdapter, FakeTaskExchangeAdapter
 from adapters.ipgold import IpgoldAdapter
 from adapters.prskill import PrskillAdapter
 from adapters.smmcode import SmmcodeAdapter
@@ -33,7 +32,6 @@ from db.database import (
     insert_order_creating,
     mark_order_active,
     update_order_status,
-    update_submission_status,
 )
 from models import (
     Order,
@@ -41,15 +39,12 @@ from models import (
     OrderStatus,
     Scenario,
     SourcePlatform,
-    SubmissionStatus,
     new_client_order_uuid,
 )
 from orchestrator import Orchestrator
 
 PANEL_EXCHANGES = {"smmcode", "prskill"}
 TASK_EXCHANGES = {"unu", "advego", "ipgold"}
-FAKE_PANEL_NAME = "fake_panel"
-FAKE_TASK_NAME = "fake_task_exchange"
 
 
 def build_adapter(
@@ -61,14 +56,8 @@ def build_adapter(
 ) -> ExchangeAdapter:
     """Pick the right adapter for an exchange.
 
-    In DRY_RUN mode, every real exchange routes to its archetype's fake.
+    DRY_RUN is enforced above the adapter layer; this factory only builds real adapters.
     """
-    if dry_run:
-        if exchange_name in PANEL_EXCHANGES or exchange_name == FAKE_PANEL_NAME:
-            return FakePanelAdapter()
-        if exchange_name in TASK_EXCHANGES or exchange_name == FAKE_TASK_NAME:
-            return FakeTaskExchangeAdapter()
-        raise ValueError(f"unknown exchange {exchange_name!r}")
     if exchange_name == "smmcode":
         return SmmcodeAdapter(settings.smmcode_api_key, http_client)
     if exchange_name == "prskill":
@@ -199,28 +188,19 @@ async def smoke(settings: Settings) -> None:
     await init_db(settings)
     print(f"[Day 1 smoke] DB initialised at {settings.db_path}")
 
-    panel_spec = OrderSpec(
-        scenario=Scenario.ACTIVITY_SUBSCRIBE,
-        exchange="fake_panel",
-        target="https://t.me/example_channel",
-        quantity=10,
-        max_cost=2.0,
-    )
-    task_spec = OrderSpec(
-        scenario=Scenario.SOCIAL_TRAFFIC,
-        exchange="fake_task_exchange",
-        target="https://example.com/landing",
-        quantity=5,
-        source_platform=SourcePlatform.VK,
-        max_cost=2.0,
-    )
-
-    await _smoke_adapter(FakePanelAdapter(), panel_spec, settings, "FakePanelAdapter")
-    await _smoke_adapter(FakeTaskExchangeAdapter(), task_spec, settings, "FakeTaskExchangeAdapter")
-
     async with connect(settings) as conn:
         n_audit = await count_audit_entries(conn)
     print(f"\n[Day 1 smoke] audit_log entries: {n_audit}")
+    print("[Day 1 smoke] configured exchanges:")
+    configured = {
+        "smmcode": bool(settings.smmcode_api_key),
+        "prskill": bool(settings.prskill_api_key),
+        "unu": bool(settings.unu_api_key),
+        "advego": bool(settings.advego_api_token),
+        "ipgold": bool(settings.ipgold_api_key),
+    }
+    for name, has_key in configured.items():
+        print(f"  {name}: {'configured' if has_key else 'missing credentials'}")
     print("[Day 1 smoke] done - foundation wiring works.")
 
 
@@ -229,6 +209,13 @@ async def smoke(settings: Settings) -> None:
 
 async def create_order_command(settings: Settings, args: argparse.Namespace) -> int:
     dry_run = args.dry_run if args.dry_run is not None else settings.dry_run
+    if dry_run:
+        print(
+            "[create-order] DRY_RUN=true: order creation is disabled because simulated "
+            "exchanges were removed.",
+            file=sys.stderr,
+        )
+        return 2
 
     try:
         spec = OrderSpec(
@@ -276,27 +263,29 @@ def _build_adapters(
     settings: Settings,
     *,
     dry_run: bool,
+    http_client: httpx.AsyncClient | None = None,
 ) -> dict[str, ExchangeAdapter]:
     """Build all adapters keyed by exchange name."""
     adapters: dict[str, ExchangeAdapter] = {}
-    if dry_run:
-        adapters["fake_panel"] = FakePanelAdapter()
-        adapters["fake_task_exchange"] = FakeTaskExchangeAdapter()
-        for name in PANEL_EXCHANGES:
-            adapters[name] = FakePanelAdapter()
-        for name in TASK_EXCHANGES:
-            adapters[name] = FakeTaskExchangeAdapter()
-    else:
-        raise NotImplementedError("LIVE mode adapters not wired yet")
+    if http_client is None:
+        raise ValueError("http_client is required for adapters")
+    for name in sorted(PANEL_EXCHANGES | TASK_EXCHANGES):
+        try:
+            adapters[name] = build_adapter(settings, name, http_client, dry_run=dry_run)
+        except ValueError:
+            # Missing credentials disable that exchange for this process. Orders
+            # already stored for it will be surfaced as "no adapter" by the orchestrator.
+            continue
     return adapters
 
 
 async def monitor_command(settings: Settings, args: argparse.Namespace) -> int:
     dry_run = args.dry_run if args.dry_run is not None else settings.dry_run
     print(f"[monitor] mode={'DRY_RUN' if dry_run else 'LIVE'}")
-    adapters = _build_adapters(settings, dry_run=dry_run)
-    orch = Orchestrator(settings, adapters)
-    results = await orch.poll_all()
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as http_client:
+        adapters = _build_adapters(settings, dry_run=dry_run, http_client=http_client)
+        orch = Orchestrator(settings, adapters)
+        results = await orch.poll_all()
     print(f"[monitor] polled {len(results)} orders")
     for r in results:
         print(f"  {r['order_uuid'][:8]}.. {r.get('status')} {r.get('exchange', '')}")
@@ -305,104 +294,23 @@ async def monitor_command(settings: Settings, args: argparse.Namespace) -> int:
 
 async def verify_command(settings: Settings, args: argparse.Namespace) -> int:
     order_uuid = args.order_uuid
-    print(f"[verify] order_uuid={order_uuid}")
-    adapters = _build_adapters(settings, dry_run=settings.dry_run)
-    orch = Orchestrator(settings, adapters)
-    result = await orch.verify_single_order(order_uuid)
+    dry_run = args.dry_run if args.dry_run is not None else settings.dry_run
+    print(f"[verify] mode={'DRY_RUN' if dry_run else 'LIVE'} order_uuid={order_uuid}")
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as http_client:
+        adapters = _build_adapters(settings, dry_run=dry_run, http_client=http_client)
+        orch = Orchestrator(settings, adapters)
+        result = await orch.verify_single_order(order_uuid)
     print(f"[verify] result: {result}")
     return 0
 
 
 async def demo_command(settings: Settings, args: argparse.Namespace) -> int:
-    """Full DRY_RUN lifecycle: create panel + task orders, poll, verify."""
-    print("[demo] === Orchestrator Demo (DRY_RUN) ===")
-    settings = settings.model_copy(update={"dry_run": True})
-    adapters = _build_adapters(settings, dry_run=True)
-    orch = Orchestrator(settings, adapters)
-
-    panel_spec = OrderSpec(
-        scenario=Scenario.ACTIVITY_SUBSCRIBE,
-        exchange="fake_panel",
-        target="https://t.me/demo_channel",
-        quantity=10,
-        max_cost=2.0,
+    """Explain why the old simulated lifecycle is no longer available."""
+    print("[demo] disabled: simulated exchanges were removed.")
+    print(
+        "[demo] use `smoke` for local wiring checks or "
+        "`monitor --dry-run` for read-only polling."
     )
-    await init_db(settings)
-    async with httpx.AsyncClient(timeout=30.0):
-        panel_adapter = adapters["fake_panel"]
-        panel_uuid, panel_ext, panel_cost = await _persist_and_create(
-            settings, panel_adapter, panel_spec, actor="demo"
-        )
-    print(f"[demo] panel order created: {panel_uuid[:8]}.. ext={panel_ext} cost={panel_cost:.2f}")
-
-    task_spec = OrderSpec(
-        scenario=Scenario.SOCIAL_TRAFFIC,
-        exchange="fake_task_exchange",
-        target="https://example.com/landing",
-        quantity=5,
-        source_platform=SourcePlatform.VK,
-        max_cost=2.0,
-    )
-    async with httpx.AsyncClient(timeout=30.0):
-        task_adapter = adapters["fake_task_exchange"]
-        task_uuid, task_ext, task_cost = await _persist_and_create(
-            settings, task_adapter, task_spec, actor="demo"
-        )
-    print(f"[demo] task order created: {task_uuid[:8]}.. ext={task_ext} cost={task_cost:.2f}")
-
-    for i in range(1, 6):
-        print(f"\n[demo] --- poll cycle {i} ---")
-        results = await orch.poll_all()
-        for r in results:
-            print(
-                f"  {r['order_uuid'][:8]}.. status={r.get('status')} exchange={r.get('exchange')}"
-            )
-        for r in results:
-            if "decisions" in r:
-                for d in r["decisions"]:
-                    print(f"    decision: {d}")
-
-    # Demo cleanup: force-accept any submissions stuck in human review so the
-    # demo always ends in terminal states (test_demo.py assertion).
-    async with connect(settings) as conn:
-        cursor = await conn.execute(
-            "SELECT submission_uuid, order_uuid FROM submissions WHERE status = ?",
-            (SubmissionStatus.AWAITING_ADMIN.value,),
-        )
-        rows = await cursor.fetchall()
-        for sub_uuid, order_uuid in rows:
-            await update_submission_status(conn, sub_uuid, SubmissionStatus.ACCEPTED)
-            await append_audit(
-                conn,
-                actor="demo",
-                event="submission_force_accepted",
-                order_uuid=order_uuid,
-                details={"submission_uuid": sub_uuid, "reason": "demo terminalisation"},
-            )
-
-        cursor = await conn.execute(
-            "SELECT client_order_uuid FROM orders WHERE status IN (?, ?)",
-            (OrderStatus.VERIFYING.value, OrderStatus.ACTIVE.value),
-        )
-        rows = await cursor.fetchall()
-        for (order_uuid,) in rows:
-            await update_order_status(conn, order_uuid, OrderStatus.COMPLETED)
-            await append_audit(
-                conn,
-                actor="demo",
-                event="order_force_completed",
-                order_uuid=order_uuid,
-                details={"reason": "demo terminalisation"},
-            )
-
-    async with connect(settings) as conn:
-        panel_final = await get_order(conn, panel_uuid)
-        task_final = await get_order(conn, task_uuid)
-        n_audit = await count_audit_entries(conn)
-    print(f"\n[demo] panel final status: {panel_final.status.value if panel_final else 'MISSING'}")
-    print(f"[demo] task final status:   {task_final.status.value if task_final else 'MISSING'}")
-    print(f"[demo] audit log entries:  {n_audit}")
-    print("[demo] done.")
     return 0
 
 
@@ -422,6 +330,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_verify = sub.add_parser("verify", help="Run verification on a single order by UUID")
     p_verify.add_argument("--order-uuid", required=True, dest="order_uuid")
+    dry_group_verify = p_verify.add_mutually_exclusive_group()
+    dry_group_verify.add_argument("--dry-run", dest="dry_run", action="store_true", default=None)
+    dry_group_verify.add_argument("--live", dest="dry_run", action="store_false")
 
     sub.add_parser("demo", help="Full DRY_RUN lifecycle demo (create + poll + verify)")
 
@@ -432,7 +343,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_create.add_argument(
         "--exchange",
         required=True,
-        choices=sorted(PANEL_EXCHANGES | TASK_EXCHANGES | {FAKE_PANEL_NAME, FAKE_TASK_NAME}),
+        choices=sorted(PANEL_EXCHANGES | TASK_EXCHANGES),
     )
     p_create.add_argument("--scenario", required=True, choices=[s.value for s in Scenario])
     p_create.add_argument("--target", required=True, help="URL / account / post link")

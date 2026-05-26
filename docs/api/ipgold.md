@@ -23,7 +23,7 @@ endpoint details and parameter schemas are not available without authentication.
 - `IpgoldAdapter` is implemented as a **provisional** `TaskExchangeAdapter`.
 - `get_balance` returns `0.0` with a warning.
 - `create_order` raises `RuntimeError` in live mode to prevent accidental placement.
-- In `DRY_RUN` mode the orchestrator routes ipgold to `FakeTaskExchangeAdapter`.
+- `create_order` remains disabled until the live write API is confirmed.
 - The adapter will be updated as soon as real API documentation or reverse-engineered
   endpoints are available.
 

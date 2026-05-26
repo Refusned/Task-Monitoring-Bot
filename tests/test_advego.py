@@ -60,10 +60,14 @@ def _xmlrpc_fault(fault_string: str) -> str:
 # --- happy paths --------------------------------------------------------------
 
 
-async def test_advego_get_balance_returns_zero() -> None:
+async def test_advego_get_balance_raises_not_implemented() -> None:
+    """Advego has no public balance endpoint. The adapter raises rather than
+    returning a fake 0.0 — and capabilities() honestly excludes GET_BALANCE.
+    """
     async with _make_client(lambda r: httpx.Response(200, text="")) as http:
         adapter = AdvegoAdapter("test_token", http)
-        assert await adapter.get_balance() == 0.0
+        with pytest.raises(NotImplementedError, match="no public balance"):
+            await adapter.get_balance()
 
 
 async def test_advego_create_order_happy_path() -> None:
@@ -252,8 +256,10 @@ async def test_advego_capabilities_task_exchange() -> None:
         adapter = AdvegoAdapter("test_token", http)
         caps = adapter.capabilities()
         assert Capability.CREATE_ORDER in caps
-        assert Capability.GET_BALANCE in caps
         assert Capability.LIST_SUBMISSIONS in caps
         assert Capability.ACCEPT_SUBMISSION in caps
         assert Capability.REJECT_SUBMISSION in caps
+        # GET_BALANCE intentionally absent: advego has no public balance API,
+        # so we don't pretend in /health output.
+        assert Capability.GET_BALANCE not in caps
         assert Capability.SUPPORTS_CLIENT_ORDER_ID not in caps

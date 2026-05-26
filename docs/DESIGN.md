@@ -3,7 +3,9 @@
 Сопроводительный документ к тестовому заданию. Описывает архитектуру, решения и
 принятые допущения по неполному ТЗ. Дополнение к [CLAUDE.md](../CLAUDE.md).
 
-> **Статус документа:** Финализирован — все компоненты реализованы, тесты проходят, demo-команда работает, CI-ready.
+> **Статус документа:** Финализирован — компоненты MVP реализованы, DRY_RUN lifecycle работает через CLI и Telegram, тесты проходят, CI-ready. **Реальные API-ключи подключены и проверены read-only live e2e тестами (9/9).**
+
+## Текущий статус (после подключения реальных API)
 
 ## Что и зачем
 
@@ -32,7 +34,8 @@
 - **Проверка результата** — независимая, не доверяем статусу биржи (A4). Для
   трафика — Яндекс.Метрика по UTM (A10). Для активности — ручной baseline +
   финальный замер с программным чтением счётчиков там, где есть API (A3).
-- **Telegram-бот** — лицо продукта; создание заказов и подтверждение оплаты.
+- **Telegram-бот** — лицо продукта; создание заказов, dashboard, ручная проверка,
+  отчётный preview и подтверждение оплаты/доработки.
 - **CLI** — движок, тестируемый интерфейс, демо.
 - **Хранилище** — SQLite в WAL, единственный источник истины.
 
@@ -95,14 +98,14 @@
 | Требование ТЗ | Реализация | Ключевые файлы |
 |---|---|---|
 | Создание заказа на бирже | `cli.py create-order`, `cli.py demo`, Telegram `/new_order` | `cli.py`, `orchestrator.py`, `adapters/base.py` |
-| Мониторинг статуса | Orchestrator.poll_all + periodic scheduler | `orchestrator.py`, `scheduler.py` |
+| Мониторинг статуса | Orchestrator.poll_all + periodic scheduler | `orchestrator.py`, `main.py` |
 | Проверка результата (активность) | ActivityVerifier — мок/реальный baseline+замер | `verification/activity.py` |
 | Проверка результата (трафик) | TrafficVerifier — мок/реальный Яндекс.Метрика | `verification/traffic.py` |
-| Принять / оплатить | `accept_submission` + C2-защита | `orchestrator.py::_accept_submission` |
-| Вернуть на доработку | `reject_submission` + C2-защита | `orchestrator.py::_reject_submission` |
-| Отчётная таблица по неделям | `reporting/sheets.py` — Google Sheets writer | `reporting/sheets.py` |
+| Принять / оплатить | `accept_submission` + C2-защита + Telegram admin callbacks/`/accept` | `orchestrator.py`, `bot/handlers.py` |
+| Вернуть на доработку | `reject_submission` + C2-защита + Telegram admin callbacks/`/reject` | `orchestrator.py`, `bot/handlers.py` |
+| Отчётная таблица по неделям | `report_rows` из SQLite → Google Sheets writer | `reporting/sheets.py` |
 | Аудит действий | `audit_log` SQLite + `append_audit` | `db/database.py` |
-| 5 бирж адаптированы | Все адаптеры реализованы + fake для DRY_RUN | `adapters/*.py` |
+| 5 бирж адаптированы | Все реальные адаптеры реализованы; DRY_RUN блокирует write-действия | `adapters/*.py` |
 | E2E-тест полного цикла | `test_demo.py`, `test_orchestrator.py`, `test_smoke.py` | `tests/test_demo.py` |
 | CI-ready | `pytest` green + `ruff check` clean | `pyproject.toml` (dev deps) |
 
@@ -113,6 +116,7 @@ python cli.py smoke        # Day 1 — проверка проводки
 python cli.py demo         # Day 3+ — полный DRY_RUN цикл
 ```
 
-- `demo` создаёт 2 заказа (panel + task), запускает 5 циклов poll+verify, force-terminalises любые stuck submissions, все заказы доходят до `completed`.
-- Audit-log: 48+ записей; double-spend guard: `payments.UNIQUE` + `action_log` claim-commit.
-- 118 тестов проходят (`pytest`), линтер чистый (`ruff check`).
+- `demo` создаёт 2 заказа (panel + task), запускает 5 циклов poll+verify и показывает терминальные решения.
+- Отдельные `create-order` → `monitor` в `DRY_RUN` работают между разными CLI-процессами.
+- Audit-log + double-spend guard: `payments.UNIQUE` + `action_log` claim-commit.
+- 135 тестов проходят (`pytest`), линтер чистый (`ruff check`).

@@ -23,8 +23,8 @@ from typing import Any
 
 import httpx
 
-from adapters.base import Capability, TaskExchangeAdapter
-from models import ExternalSubmission, OrderSpec
+from adapters.base import Capability, ServiceOption, TaskExchangeAdapter, keywords_for_scenario
+from models import ExternalSubmission, OrderSpec, Scenario
 
 _BASE_URL = "https://api.advego.com/xml"
 _TYPES_TTL_SECONDS = 300.0
@@ -127,19 +127,26 @@ class AdvegoAdapter(TaskExchangeAdapter):
         self._types_cache_at: float = 0.0
 
     def capabilities(self) -> set[Capability]:
+        # NB: Advego's public XML-RPC docs don't expose a balance endpoint.
+        # We intentionally DO NOT declare Capability.GET_BALANCE — `/health`
+        # would otherwise show a green check for a stubbed 0.0 value, which is
+        # actively misleading. When/if Advego ships a balance method, add the
+        # capability + implement get_balance.
         return {
             Capability.CREATE_ORDER,
             Capability.GET_ORDER_STATUS,
-            Capability.GET_BALANCE,
             Capability.LIST_SUBMISSIONS,
             Capability.ACCEPT_SUBMISSION,
             Capability.REJECT_SUBMISSION,
         }
 
     async def get_balance(self) -> float:
-        # Advego does not expose a direct balance endpoint in the public XML-RPC docs.
-        # We return 0.0 and let the caller handle it via configuration or external tracking.
-        return 0.0
+        # Public XML-RPC docs don't expose a balance endpoint; we surface this
+        # honestly via capabilities() rather than returning a misleading 0.0.
+        raise NotImplementedError(
+            "advego has no public balance endpoint — capability GET_BALANCE is "
+            "intentionally absent from capabilities()"
+        )
 
     async def create_order(self, spec: OrderSpec, client_order_uuid: str) -> tuple[str, float]:
         # Estimate-first cost check.
@@ -225,6 +232,42 @@ class AdvegoAdapter(TaskExchangeAdapter):
             "advego.returnJob",
             {"token": self._api_token, "ID": str(external_submission_id), "comment": comment},
         )
+
+    async def list_services_for_scenario(
+        self,
+        scenario: Scenario,
+        limit: int = 8,
+    ) -> list[ServiceOption]:
+        """Filter Advego order_types by scenario keywords. Advego's
+        `getOrderTypes` doesn't expose per-unit price publicly — the picker
+        therefore omits price, and the orchestrator's estimate-first cost cap
+        falls back to a conservative floor (`_order_type_cost`).
+        """
+        types = await self._get_order_types()
+        keywords = keywords_for_scenario(scenario)
+        if not keywords:
+            return []
+        candidates: list[ServiceOption] = []
+        for t in types.values():
+            name = str(t.get("name", ""))
+            haystack = name.lower()
+            if not any(kw in haystack for kw in keywords):
+                continue
+            cost_raw = t.get("min_cost") or t.get("cost")
+            try:
+                price = float(cost_raw) if cost_raw is not None else None
+            except (TypeError, ValueError):
+                price = None
+            candidates.append(
+                ServiceOption(
+                    service_id=str(t.get("id", "")),
+                    name=name,
+                    price_per_unit=price,
+                )
+            )
+        # Sort by name (price is usually unknown for Advego types).
+        candidates.sort(key=lambda s: (s.price_per_unit is None, s.price_per_unit or 0.0, s.name))
+        return candidates[:limit]
 
     # --- internal helpers --------------------------------------------------
 

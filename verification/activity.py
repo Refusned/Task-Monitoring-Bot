@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import random
 
-from models import Order, Scenario, VerificationResult, VerificationVerdict
+from models import Order, Scenario, Submission, VerificationResult, VerificationVerdict
 from verification.base import Verifier, _make_result
 
 
@@ -43,9 +43,10 @@ class ActivityVerifier(Verifier):
             )
 
         expected = float(order.spec.quantity)
+        submission = kwargs.get("submission")
 
         if self._mock:
-            measured = self._mock_delta(order)
+            measured = self._mock_delta(order, submission=submission)
             return _make_result(
                 measured=measured,
                 expected=expected,
@@ -67,7 +68,12 @@ class ActivityVerifier(Verifier):
             raw_evidence={"verifier": "activity", "mode": "real", "status": "not_implemented"},
         )
 
-    def _mock_delta(self, order: Order) -> float:
+    def _mock_delta(self, order: Order, submission: Submission | None = None) -> float:
+        if submission is not None and submission.evidence == "good":
+            return float(order.spec.quantity)
+        if submission is not None and submission.evidence == "weak":
+            return float(max(0, int(order.spec.quantity * 0.2)))
+
         seed = hash(order.client_order_uuid) % 10000
         rng = random.Random(seed)
         if rng.random() < self._mock_hit_ratio:

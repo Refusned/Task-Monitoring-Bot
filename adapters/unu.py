@@ -22,11 +22,33 @@ from typing import Any
 
 import httpx
 
-from adapters.base import Capability, TaskExchangeAdapter
-from models import ExternalSubmission, OrderSpec
+from adapters.base import Capability, ServiceOption, TaskExchangeAdapter, keywords_for_scenario
+from models import ExternalSubmission, OrderSpec, Scenario
 
 _BASE_URL = "https://unu.im/api"
 _SERVICES_TTL_SECONDS = 300.0
+
+
+def _extract_unu_evidence(messages: Any) -> str | None:
+    """Pull worker evidence text out of UNU's `messages` payload.
+
+    UNU returns messages as a list of dicts like `{"text": "...", ...}`. We
+    join the text fields into a single human-readable string. Returns `None`
+    if there are no messages — the verifier treats that as "no evidence",
+    which routes to NEEDS_HUMAN_REVIEW (safer than auto-pass).
+    """
+    if not isinstance(messages, list) or not messages:
+        return None
+    parts: list[str] = []
+    for m in messages:
+        if isinstance(m, dict):
+            text = m.get("text") or m.get("message") or m.get("body")
+            if text:
+                parts.append(str(text))
+        elif isinstance(m, str):
+            parts.append(m)
+    return "\n".join(parts) if parts else None
+
 
 # Task status (from get_tasks) raw -> normalized order status
 _TASK_STATUS_MAP: dict[int, str] = {
@@ -127,7 +149,7 @@ class UnuAdapter(TaskExchangeAdapter):
                 ExternalSubmission(
                     external_submission_id=str(report.get("id")),
                     executor_hint=str(report.get("worker_id")) if report.get("worker_id") else None,
-                    evidence=str(report.get("messages", [])),
+                    evidence=_extract_unu_evidence(report.get("messages")),
                 )
             )
         return results
@@ -152,6 +174,49 @@ class UnuAdapter(TaskExchangeAdapter):
             }
         )
 
+    async def list_services_for_scenario(
+        self,
+        scenario: Scenario,
+        limit: int = 8,
+    ) -> list[ServiceOption]:
+        """Pick UNU tariffs whose name matches scenario keywords. UNU uses
+        `min_price_rub` as the price floor; we treat it as the assumed
+        per-unit price for the picker label.
+        """
+        tariffs = await self._get_tariffs()
+        keywords = keywords_for_scenario(scenario)
+        if not keywords:
+            return []
+        candidates: list[ServiceOption] = []
+        for tariff in tariffs.values():
+            name = str(tariff.get("name", ""))
+            haystack = name.lower()
+            if not any(kw in haystack for kw in keywords):
+                continue
+            price = None
+            for key in ("min_price_rub", "price", "cost"):
+                raw = tariff.get(key)
+                if raw is None:
+                    continue
+                try:
+                    val = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if val > 0:
+                    price = val
+                    break
+            if price is None:
+                continue  # no usable price → skip (money-safety)
+            candidates.append(
+                ServiceOption(
+                    service_id=str(tariff.get("id", "")),
+                    name=name,
+                    price_per_unit=price,
+                )
+            )
+        candidates.sort(key=lambda s: (s.price_per_unit or 0.0, s.name))
+        return candidates[:limit]
+
     # --- internal helpers --------------------------------------------------
 
     async def _post(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -168,12 +233,43 @@ class UnuAdapter(TaskExchangeAdapter):
         return payload
 
     async def _tariff_price(self, tariff_id: str) -> float:
+        """Estimate-first price-per-execution for the given tariff.
+
+        UNU exposes tariffs with a `min_price_rub` field (the floor — minimum
+        accepted price per unit). For estimate-first cost capping we treat the
+        floor as the assumed price: if even the floor times quantity exceeds
+        spec.max_cost, placement is refused. This prevents the worst-case
+        (CRITICAL money-safety): a missing/renamed field returning 0.0, which
+        would silently bypass the cost cap and let the bot place an order at
+        whatever price UNU assigns server-side.
+
+        Probe order (first non-zero wins):
+          1. `min_price_rub` — current UNU field (verified live, 2026-05).
+          2. `price`         — historic field, kept for compat.
+          3. `cost`          — historic field, kept for compat.
+
+        If none of these is positive, we raise loudly — better a refused order
+        than a $$-leak.
+        """
         tariffs = await self._get_tariffs()
         tariff = tariffs.get(str(tariff_id))
         if tariff is None:
             raise ValueError(f"unu: tariff_id {tariff_id} not found")
-        # UNU tariff price is per execution in rubles.
-        return float(tariff.get("price", tariff.get("cost", 0.0)))
+        for key in ("min_price_rub", "price", "cost"):
+            raw = tariff.get(key)
+            if raw is None:
+                continue
+            try:
+                price = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if price > 0:
+                return price
+        raise ValueError(
+            f"unu: tariff_id {tariff_id} has no usable price field "
+            f"(tried min_price_rub/price/cost); refusing to place an order "
+            f"without a real price — UNU API contract may have changed"
+        )
 
     async def _get_tariffs(self) -> dict[str, dict[str, Any]]:
         if (

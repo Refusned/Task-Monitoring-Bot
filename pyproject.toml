@@ -16,6 +16,7 @@ dependencies = [
     "pydantic-settings>=2.2",
     "gspread>=6.0",
     "google-auth>=2.29",
+    "typer>=0.12",
 ]
 
 [project.optional-dependencies]

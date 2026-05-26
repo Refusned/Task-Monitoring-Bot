@@ -18,7 +18,7 @@ def _make_order(
 ) -> Order:
     spec = OrderSpec(
         scenario=scenario,
-        exchange="fake_panel" if scenario != Scenario.SOCIAL_TRAFFIC else "fake_task_exchange",
+        exchange="smmcode" if scenario != Scenario.SOCIAL_TRAFFIC else "unu",
         target="https://t.me/test"
         if scenario != Scenario.SOCIAL_TRAFFIC
         else "https://example.com",

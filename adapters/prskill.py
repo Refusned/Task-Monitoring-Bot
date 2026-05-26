@@ -26,8 +26,8 @@ from typing import Any
 
 import httpx
 
-from adapters.base import Capability, PanelAdapter
-from models import OrderSpec
+from adapters.base import Capability, PanelAdapter, ServiceOption, keywords_for_scenario
+from models import OrderSpec, Scenario
 
 _BASE_URL = "https://prskill.ru/api"
 _SERVICES_TTL_SECONDS = 300.0
@@ -137,6 +137,50 @@ class PrskillAdapter(PanelAdapter):
         if isinstance(payload, dict) and "error" in payload:
             raise RuntimeError(f"prskill error: {payload['error']!r}")
         return payload
+
+    async def list_services_for_scenario(
+        self,
+        scenario: Scenario,
+        limit: int = 8,
+    ) -> list[ServiceOption]:
+        """Filter cached `/services` by name keywords for the chosen scenario.
+        Sorted by price-per-unit (here `rate`) ascending.
+        """
+        services = await self._get_services()
+        keywords = keywords_for_scenario(scenario)
+        if not keywords:
+            return []
+        candidates: list[ServiceOption] = []
+        for svc in services.values():
+            name = str(svc.get("name", ""))
+            haystack = name.lower()
+            if not any(kw in haystack for kw in keywords):
+                continue
+            try:
+                rate = float(svc.get("rate", 0))
+            except (TypeError, ValueError):
+                rate = 0.0
+            if rate <= 0:
+                continue
+            try:
+                min_q = int(svc.get("min", 0)) or None
+            except (TypeError, ValueError):
+                min_q = None
+            try:
+                max_q = int(svc.get("max", 0)) or None
+            except (TypeError, ValueError):
+                max_q = None
+            candidates.append(
+                ServiceOption(
+                    service_id=str(svc.get("service", svc.get("id", ""))),
+                    name=name,
+                    price_per_unit=rate,
+                    min_quantity=min_q,
+                    max_quantity=max_q,
+                )
+            )
+        candidates.sort(key=lambda s: (s.price_per_unit or 0.0, s.name))
+        return candidates[:limit]
 
     async def _service_rate(self, service_id: str) -> float:
         services = await self._get_services()

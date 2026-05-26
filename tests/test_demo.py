@@ -11,7 +11,7 @@ import pytest
 
 from cli import demo_command
 from config import Settings
-from db.database import connect, get_order, init_db
+from db.database import connect, init_db
 
 
 @pytest.fixture
@@ -32,7 +32,7 @@ async def demo_db():
 
 @pytest.mark.asyncio
 async def test_demo_runs_without_error(demo_db: Settings) -> None:
-    """Demo creates orders, polls them, and reaches terminal states."""
+    """Demo exits cleanly and no longer creates simulated orders."""
     args = argparse.Namespace()
     exit_code = await demo_command(demo_db, args)
     assert exit_code == 0
@@ -40,13 +40,4 @@ async def test_demo_runs_without_error(demo_db: Settings) -> None:
     async with connect(demo_db) as conn:
         cursor = await conn.execute("SELECT client_order_uuid FROM orders")
         rows = await cursor.fetchall()
-        orders = [row[0] for row in rows]
-        assert len(orders) == 2
-
-        # At least one should be terminal
-        terminal = {"completed", "failed"}
-        statuses = []
-        for cid in orders:
-            o = await get_order(conn, cid)
-            statuses.append(o.status.value if o else "missing")
-        assert any(s in terminal for s in statuses), f"statuses={statuses}"
+        assert rows == []

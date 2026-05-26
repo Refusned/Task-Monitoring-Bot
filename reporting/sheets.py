@@ -30,29 +30,46 @@ def _get_week_range(anchor: datetime | None = None) -> tuple[str, str]:
     return label, iso
 
 
-def _build_report_rows(settings: Settings, week_label: str) -> list[dict[str, Any]]:
+async def _build_report_rows(
+    settings: Settings,
+    week_label: str,
+    iso_week: str,
+) -> list[dict[str, Any]]:
     """Query the local DB for completed SOCIAL_TRAFFIC orders in the current week
     and return rows ready for Sheets.
     """
-    # In a real implementation this queries report_rows or orders table.
-    # For MVP we return a demo row structure that the caller flattens.
-    # When real data is present in `report_rows`, read it; otherwise demo.
-    rows: list[dict[str, Any]] = []
-    # Stub: the orchestrator (Day 3+) will populate `report_rows`.
-    # Until then we emit a demo row so the Sheets integration is testable.
-    for _platform in settings.target_social_accounts:
-        rows.append(
-            {
-                "week": week_label,
-                "source_platform": "vk",  # placeholder
-                "exchange": "smmcode",
-                "ordered_count": 100,
-                "actual_count": 87,
-                "cost": 5.0,
-                "status": "completed",
-            }
+    async with connect(settings) as conn:
+        cursor = await conn.execute(
+            "SELECT source_platform, exchange, "
+            "SUM(ordered_count) AS ordered_count, "
+            "SUM(COALESCE(actual_count, 0)) AS actual_count, "
+            "SUM(COALESCE(cost, 0)) AS cost, "
+            "GROUP_CONCAT(DISTINCT status) AS status "
+            "FROM report_rows WHERE week = ? "
+            "GROUP BY source_platform, exchange "
+            "ORDER BY source_platform, exchange",
+            (iso_week,),
         )
-    return rows
+        rows = await cursor.fetchall()
+
+    return [
+        {
+            "week": week_label,
+            "source_platform": row["source_platform"],
+            "exchange": row["exchange"],
+            "ordered_count": int(row["ordered_count"] or 0),
+            "actual_count": int(row["actual_count"] or 0),
+            "cost": float(row["cost"] or 0),
+            "status": row["status"] or "unknown",
+        }
+        for row in rows
+    ]
+
+
+async def preview_weekly_rows(settings: Settings) -> list[dict[str, Any]]:
+    """Return current weekly rows without writing to Google Sheets."""
+    week_label, iso_week = _get_week_range()
+    return await _build_report_rows(settings, week_label, iso_week)
 
 
 class SheetsReporter:
@@ -96,8 +113,8 @@ class SheetsReporter:
 
     async def run_weekly_report(self) -> None:
         """Fetch current-week data from DB and write to Sheets."""
-        week_label, _iso_week = _get_week_range()
-        rows = _build_report_rows(self._settings, week_label)
+        week_label, iso_week = _get_week_range()
+        rows = await _build_report_rows(self._settings, week_label, iso_week)
         if not rows:
             return
 

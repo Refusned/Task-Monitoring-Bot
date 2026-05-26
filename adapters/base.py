@@ -15,9 +15,10 @@ subclass; this prevents consumers from calling them blindly via the base type.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import StrEnum
 
-from models import ExternalSubmission, OrderSpec
+from models import ExternalSubmission, OrderSpec, Scenario
 
 
 class Capability(StrEnum):
@@ -34,6 +35,67 @@ class Capability(StrEnum):
     SUPPORTS_CLIENT_ORDER_ID = "supports_client_order_id"
 
 
+@dataclass(frozen=True, slots=True)
+class ServiceOption:
+    """A single picker option in the bot's «choose service» step.
+
+    Adapters convert their native catalogue entries into `ServiceOption`s so the
+    bot can render them as inline buttons without knowing the per-exchange JSON
+    shape. `price_per_unit` is in RUB where applicable; `None` means the price
+    can't be known up front (advego order_types) and the cost cap will kick in
+    against a conservative server-side floor at placement time.
+    """
+
+    service_id: str
+    name: str
+    price_per_unit: float | None = None
+    min_quantity: int | None = None
+    max_quantity: int | None = None
+
+    @property
+    def button_label(self) -> str:
+        """Short label fit for an inline-keyboard button (Telegram caps ~64 chars)."""
+        bits: list[str] = [self.name[:38]]
+        if self.price_per_unit is not None and self.price_per_unit > 0:
+            bits.append(f"₽{self.price_per_unit:g}/шт")
+        if self.min_quantity is not None and self.min_quantity > 1:
+            bits.append(f"≥{self.min_quantity}")
+        return " · ".join(bits)
+
+
+# Scenario → list of lower-case substrings to match against service names.
+# Each adapter's catalogue uses its own naming conventions; these keywords
+# cover the common Russian + English wording on smmcode/unu/advego.
+_SCENARIO_KEYWORDS: dict[Scenario, tuple[str, ...]] = {
+    Scenario.ACTIVITY_SUBSCRIBE: (
+        "подпис",  # Подписчики / Подписка
+        "follow",
+        "subscrib",
+    ),
+    Scenario.ACTIVITY_LIKE: (
+        "лайк",
+        "like",
+        "оценк",
+        "сердечк",
+        "нравит",
+    ),
+    Scenario.SOCIAL_TRAFFIC: (
+        "переход",
+        "трафик",
+        "traffic",
+        "посет",
+        "visit",
+        "click",
+        "клик",
+    ),
+}
+
+
+def keywords_for_scenario(scenario: Scenario) -> tuple[str, ...]:
+    """Return the substring filters used by adapters to narrow the catalogue."""
+    return _SCENARIO_KEYWORDS.get(scenario, ())
+
+
 class ExchangeAdapter(ABC):
     """Thin base: name, capability declaration, balance access."""
 
@@ -44,6 +106,20 @@ class ExchangeAdapter(ABC):
 
     @abstractmethod
     async def get_balance(self) -> float: ...
+
+    async def list_services_for_scenario(
+        self,
+        scenario: Scenario,
+        limit: int = 8,
+    ) -> list[ServiceOption]:
+        """Return up to `limit` services from this exchange's catalogue that
+        plausibly satisfy `scenario`.
+
+        Adapters override this with a real catalogue fetch + keyword filter.
+        The base implementation returns an empty list — this surfaces honestly
+        to the bot's UI as "manual entry only" rather than crashing.
+        """
+        return []
 
 
 class PanelAdapter(ExchangeAdapter):

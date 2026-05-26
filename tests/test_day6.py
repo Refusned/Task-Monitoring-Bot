@@ -9,7 +9,7 @@ import pytest
 
 from bot.keyboards import accept_rework, confirm_order
 from config import Settings
-from db.database import append_audit, connect, count_audit_entries, init_db
+from db.database import append_audit, connect, count_audit_entries, init_db, insert_report_row
 from posts.watcher import _extract_last_post_id, _load_state, _save_state
 from reporting.sheets import _get_week_range
 
@@ -35,8 +35,9 @@ def test_accept_rework_keyboard() -> None:
 
 def test_confirm_order_keyboard() -> None:
     kb = confirm_order("order-456")
-    assert kb.inline_keyboard[0][0].callback_data == "confirm_order:order-456"
-    assert kb.inline_keyboard[0][1].callback_data == "cancel_order:order-456"
+    # Day 6 UX rewrite: new "no:" namespace for new-order callbacks.
+    assert kb.inline_keyboard[0][0].callback_data == "no:confirm:order-456"
+    assert kb.inline_keyboard[0][1].callback_data == "no:cancel"
 
 
 # --- posts/watcher -----------------------------------------------------------
@@ -102,3 +103,109 @@ async def test_audit_log_from_reporting(settings: Settings) -> None:
         await append_audit(conn, actor="test", event="sheets_ping")
         after = await count_audit_entries(conn)
     assert after == before + 1
+
+
+async def test_report_preview_reads_db_rows(settings: Settings) -> None:
+    from reporting.sheets import _get_week_range, preview_weekly_rows
+
+    week_label, iso_week = _get_week_range()
+    await init_db(settings)
+    async with connect(settings) as conn:
+        await insert_report_row(
+            conn,
+            week=iso_week,
+            source_platform="vk",
+            exchange="unu",
+            ordered_count=5,
+            actual_count=4,
+            cost=0.5,
+            status="completed",
+        )
+
+    rows = await preview_weekly_rows(settings)
+
+    assert rows == [
+        {
+            "week": week_label,
+            "source_platform": "vk",
+            "exchange": "unu",
+            "ordered_count": 5,
+            "actual_count": 4,
+            "cost": 0.5,
+            "status": "completed",
+        }
+    ]
+
+
+# --- bot/handlers -----------------------------------------------------------
+
+
+class _FakeUser:
+    id = 42
+
+
+class _FakeMessage:
+    from_user = _FakeUser()
+
+    def __init__(self, text: str = "") -> None:
+        self.text = text
+        self.answers: list[str] = []
+
+    async def answer(self, text: str, **_kwargs) -> None:
+        self.answers.append(text)
+
+
+async def test_orders_command_admin_wrapper_accepts_state(settings: Settings) -> None:
+    from bot.handlers import cmd_orders
+
+    settings = settings.model_copy(update={"telegram_admin_ids": [42]})
+    await init_db(settings)
+
+    message = _FakeMessage()
+    await cmd_orders(message, object(), settings)
+
+    # Day 6 UX rewrite: empty-list message now suggests the next action.
+    assert len(message.answers) == 1
+    assert message.answers[0].startswith("Нет активных заказов.")
+    assert "Новый заказ" in message.answers[0]
+
+
+async def test_accept_command_uses_admin_decision(monkeypatch, settings: Settings) -> None:
+    """Day 6 UX rewrite: helper renamed to `_decide_submission` and the user-
+    facing reply uses Markdown emphasis on the decision verb.
+    """
+    from bot import handlers
+
+    settings = settings.model_copy(update={"telegram_admin_ids": [42]})
+    calls = []
+
+    async def fake_decide(settings_arg, submission_uuid, *, actor, accept, reason=None):
+        calls.append((settings_arg, submission_uuid, actor, accept, reason))
+        return {"decision": "accepted"}
+
+    monkeypatch.setattr(handlers, "_decide_submission", fake_decide)
+
+    message = _FakeMessage("/accept sub-1")
+    await handlers.cmd_accept_submission(message, object(), settings)
+
+    assert message.answers == ["✅ Решение: *accepted*"]
+    assert calls == [(settings, "sub-1", "tg:42", True, None)]
+
+
+async def test_reject_command_accepts_reason(monkeypatch, settings: Settings) -> None:
+    from bot import handlers
+
+    settings = settings.model_copy(update={"telegram_admin_ids": [42]})
+    calls = []
+
+    async def fake_decide(settings_arg, submission_uuid, *, actor, accept, reason=None):
+        calls.append((settings_arg, submission_uuid, actor, accept, reason))
+        return {"decision": "rejected"}
+
+    monkeypatch.setattr(handlers, "_decide_submission", fake_decide)
+
+    message = _FakeMessage("/reject sub-2 Нужно исправить отчёт")
+    await handlers.cmd_reject_submission(message, object(), settings)
+
+    assert message.answers == ["❌ Решение: *rejected*"]
+    assert calls == [(settings, "sub-2", "tg:42", False, "Нужно исправить отчёт")]

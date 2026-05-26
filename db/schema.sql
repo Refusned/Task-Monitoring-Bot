@@ -52,6 +52,16 @@ CREATE TABLE IF NOT EXISTS submissions (
 CREATE INDEX IF NOT EXISTS idx_submissions_order ON submissions(order_uuid);
 CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions(status);
 
+-- Day 3 audit (CRITICAL-1 fix): one local row per external submission per order.
+-- Partial unique index (skips NULL external_submission_id) so two concurrent
+-- pollers converge on a single canonical row via INSERT OR IGNORE in
+-- ensure_submission_persisted(). Applies to fresh installs AND to the existing
+-- live DB (CREATE INDEX IF NOT EXISTS is idempotent, unlike inline UNIQUE on a
+-- pre-existing table).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_submissions_order_external
+    ON submissions(order_uuid, external_submission_id)
+    WHERE external_submission_id IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS payments (
     -- C2: terminal money decision per submission is UNIQUE.
     exchange TEXT NOT NULL,
@@ -109,4 +119,10 @@ CREATE TABLE IF NOT EXISTS report_rows (
     cost REAL CHECK(cost IS NULL OR cost >= 0),
     status TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS watcher_state (
+    account_url TEXT PRIMARY KEY,
+    last_post_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
