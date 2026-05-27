@@ -66,6 +66,16 @@ async def test_activity_verifier_mock() -> None:
 
 
 @pytest.mark.asyncio
+async def test_activity_verifier_supports_views() -> None:
+    verifier = ActivityVerifier(mock=True)
+    order = _make_order(Scenario.ACTIVITY_VIEW, quantity=100)
+    result = await verifier.verify(order)
+    assert result.expected == 100.0
+    assert result.verdict in ("auto_pass", "needs_human_review", "fail")
+    assert result.raw_evidence["scenario"] == "activity_view"
+
+
+@pytest.mark.asyncio
 async def test_activity_verifier_wrong_scenario() -> None:
     verifier = ActivityVerifier(mock=True)
     order = _make_order(Scenario.SOCIAL_TRAFFIC, source_platform=SourcePlatform.VK)

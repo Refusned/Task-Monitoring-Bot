@@ -79,6 +79,12 @@ _SCENARIO_KEYWORDS: dict[Scenario, tuple[str, ...]] = {
         "сердечк",
         "нравит",
     ),
+    Scenario.ACTIVITY_VIEW: (
+        "просмотр",
+        "view",
+        "watch",
+        "показ",
+    ),
     Scenario.SOCIAL_TRAFFIC: (
         "переход",
         "трафик",

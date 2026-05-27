@@ -14,6 +14,7 @@ class Scenario(StrEnum):
 
     ACTIVITY_SUBSCRIBE = "activity_subscribe"
     ACTIVITY_LIKE = "activity_like"
+    ACTIVITY_VIEW = "activity_view"
     SOCIAL_TRAFFIC = "social_traffic"
 
 

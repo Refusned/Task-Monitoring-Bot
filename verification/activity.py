@@ -1,4 +1,4 @@
-"""Activity verifier: checks subscribe / like completion.
+"""Activity verifier: checks subscribe / like / view completion.
 
 A4: independent check, not trusting exchange status.
 For MVP we use deterministic mock evidence (public counters are hard to query
@@ -15,7 +15,7 @@ from verification.base import Verifier, _make_result
 
 
 class ActivityVerifier(Verifier):
-    """Verify ACTIVITY_SUBSCRIBE / ACTIVITY_LIKE orders.
+    """Verify ACTIVITY_SUBSCRIBE / ACTIVITY_LIKE / ACTIVITY_VIEW orders.
 
     Mock mode (default): synthesises completion counts.
     """
@@ -33,6 +33,7 @@ class ActivityVerifier(Verifier):
         if order.spec.scenario not in (
             Scenario.ACTIVITY_SUBSCRIBE,
             Scenario.ACTIVITY_LIKE,
+            Scenario.ACTIVITY_VIEW,
         ):
             return VerificationResult(
                 verdict=VerificationVerdict.NEEDS_HUMAN_REVIEW,

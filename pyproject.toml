@@ -28,7 +28,7 @@ dev = [
 
 [tool.setuptools]
 py-modules = ["config", "models", "cli", "conftest", "main"]
-packages = ["db", "adapters", "bot", "posts", "reporting"]
+packages = ["db", "adapters", "autopilot", "bot", "posts", "reporting"]
 
 [tool.ruff]
 line-length = 100

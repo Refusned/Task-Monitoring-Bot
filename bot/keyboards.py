@@ -11,6 +11,7 @@ Callback-data conventions:
 - `no:exchange:<value>`      — exchange chosen
 - `no:platform:<value>`      — source platform chosen (SOCIAL_TRAFFIC only)
 - `no:confirm:<uuid>`        — confirm a draft order
+- `ap:*`                    — autopilot goal flow
 - `no:cancel`                — cancel the current FSM
 - `accept:<sub_uuid>`        — accept a submission (admin)
 - `reject:<sub_uuid>`        — reject a submission (admin)
@@ -33,6 +34,7 @@ from models import Scenario, SourcePlatform
 
 # Labels for the persistent Reply keyboard.
 BTN_NEW_ORDER = "📦 Новый заказ"
+BTN_AUTOPILOT = "🎯 Цель"
 BTN_BALANCE = "💰 Баланс"
 BTN_DASHBOARD = "📊 Сводка"
 BTN_ORDERS = "📋 Заказы"
@@ -55,10 +57,11 @@ def main_menu() -> ReplyKeyboardMarkup:
     """
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=BTN_NEW_ORDER), KeyboardButton(text=BTN_BALANCE)],
-            [KeyboardButton(text=BTN_DASHBOARD), KeyboardButton(text=BTN_ORDERS)],
-            [KeyboardButton(text=BTN_CHECK), KeyboardButton(text=BTN_REVIEW)],
-            [KeyboardButton(text=BTN_REPORT), KeyboardButton(text=BTN_HEALTH)],
+            [KeyboardButton(text=BTN_AUTOPILOT), KeyboardButton(text=BTN_NEW_ORDER)],
+            [KeyboardButton(text=BTN_BALANCE), KeyboardButton(text=BTN_DASHBOARD)],
+            [KeyboardButton(text=BTN_ORDERS), KeyboardButton(text=BTN_CHECK)],
+            [KeyboardButton(text=BTN_REVIEW), KeyboardButton(text=BTN_REPORT)],
+            [KeyboardButton(text=BTN_HEALTH)],
             [KeyboardButton(text=BTN_CANCEL)],
         ],
         resize_keyboard=True,
@@ -88,6 +91,10 @@ def scenario_choice() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="❤️ Лайки",
                     callback_data=f"no:scenario:{Scenario.ACTIVITY_LIKE.value}",
+                ),
+                InlineKeyboardButton(
+                    text="▶️ Просмотры",
+                    callback_data=f"no:scenario:{Scenario.ACTIVITY_VIEW.value}",
                 ),
             ],
             [

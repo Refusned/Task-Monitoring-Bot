@@ -3,6 +3,7 @@
 Commands:
 - `smoke` (Day 1) - wiring check for config and database.
 - `create-order` (Day 2) - place an order on the chosen exchange.
+- `autopilot` - parse a natural-language goal via Ollama and place the cheapest viable order.
 - `demo` (Day 3+) - disabled since simulated exchanges were removed.
 """
 
@@ -313,6 +314,44 @@ async def demo_command(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
+async def autopilot_command(settings: Settings, args: argparse.Namespace) -> int:
+    """LLM-driven goal -> cheapest viable service -> optional live order."""
+    from autopilot.ollama import OllamaPlanner
+    from autopilot.runner import AutopilotRunner, format_autopilot_result
+
+    goal_text = args.goal or " ".join(args.goal_words or [])
+    goal_text = goal_text.strip()
+    if not goal_text:
+        print("[autopilot] goal text is required", file=sys.stderr)
+        return 2
+
+    dry_run = args.dry_run if args.dry_run is not None else settings.dry_run
+    effective_settings = settings.model_copy(update={"dry_run": dry_run})
+    await init_db(effective_settings)
+
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as http_client:
+        adapters = _build_adapters(
+            effective_settings,
+            dry_run=dry_run,
+            http_client=http_client,
+        )
+        planner = OllamaPlanner(
+            base_url=effective_settings.ollama_base_url,
+            model=effective_settings.ollama_model,
+            http_client=http_client,
+            timeout_seconds=effective_settings.ollama_timeout_seconds,
+        )
+        runner = AutopilotRunner(effective_settings, adapters, planner)
+        result = await runner.run_goal(
+            goal_text,
+            actor="cli:autopilot",
+            execute=not args.plan_only,
+        )
+
+    print(format_autopilot_result(result))
+    return 0 if result.status in {"created", "planned", "dry_run"} else 1
+
+
 # --- argparse / dispatch ------------------------------------------------------
 
 
@@ -334,6 +373,32 @@ def _build_parser() -> argparse.ArgumentParser:
     dry_group_verify.add_argument("--live", dest="dry_run", action="store_false")
 
     sub.add_parser("demo", help="Full DRY_RUN lifecycle demo (create + poll + verify)")
+
+    p_autopilot = sub.add_parser(
+        "autopilot",
+        help="Use Ollama to parse a goal and automatically choose the cheapest viable service",
+    )
+    p_autopilot.add_argument("goal_words", nargs="*", help="Goal text, e.g. '500 likes ...'")
+    p_autopilot.add_argument("--goal", help="Goal text; overrides positional words")
+    p_autopilot.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="Parse and select a service but do not create an order",
+    )
+    dry_group_autopilot = p_autopilot.add_mutually_exclusive_group()
+    dry_group_autopilot.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=None,
+        help="Force planning-only mode regardless of .env",
+    )
+    dry_group_autopilot.add_argument(
+        "--live",
+        dest="dry_run",
+        action="store_false",
+        help="Allow live order creation when DRY_RUN=false is also intended",
+    )
 
     p_create = sub.add_parser(
         "create-order",
@@ -389,6 +454,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(monitor_command(settings, args))
     if args.command == "verify":
         return asyncio.run(verify_command(settings, args))
+    if args.command == "autopilot":
+        return asyncio.run(autopilot_command(settings, args))
     if args.command == "demo":
         return asyncio.run(demo_command(settings, args))
     return 2  # unreachable - argparse requires command

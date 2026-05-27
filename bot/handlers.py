@@ -25,8 +25,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
+from autopilot.ollama import OllamaPlanner
+from autopilot.runner import AutopilotRunner, format_autopilot_result
 from bot import keyboards
 from bot.keyboards import (
+    BTN_AUTOPILOT,
     BTN_BALANCE,
     BTN_CANCEL,
     BTN_CHECK,
@@ -100,6 +103,10 @@ class NewOrderFSM(StatesGroup):
     confirm = State()
 
 
+class AutopilotFSM(StatesGroup):
+    goal = State()
+
+
 # ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
@@ -121,9 +128,9 @@ async def on_startup(bot: Bot, settings: Settings) -> None:
 WELCOME_TEXT = (
     "👋 *Бот мониторинга бирж*\n\n"
     "Создаю и веду заказы на 5 биржах накрутки и микрозадач, проверяю\n"
-    "результат и помогаю с приёмом или возвратом сабмишенов.\n\n"
+    "результат и могу автоматически выбрать биржу по цели через LLM.\n\n"
     "Главное меню — внизу под полем ввода. Нажимайте кнопки —\n"
-    "ничего печатать не нужно."
+    "или отправьте цель одной фразой через /goal."
 )
 
 
@@ -173,6 +180,17 @@ async def reply_new_order(
     **kwargs: Any,
 ) -> None:
     await _start_new_order(message, state)
+
+
+@router.message(F.text == BTN_AUTOPILOT)
+@_require_admin_msg
+async def reply_autopilot_goal(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    **kwargs: Any,
+) -> None:
+    await _ask_autopilot_goal(message, state)
 
 
 @router.message(F.text == BTN_BALANCE)
@@ -285,6 +303,79 @@ async def cmd_new_order(
     **kwargs: Any,
 ) -> None:
     await _start_new_order(message, state)
+
+
+@router.message(Command("goal"))
+@_require_admin_msg
+async def cmd_goal(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    **kwargs: Any,
+) -> None:
+    text = (message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    if len(parts) == 1:
+        await _ask_autopilot_goal(message, state)
+        return
+    await state.clear()
+    await _run_autopilot_goal(message, settings, parts[1], actor=f"tg:{message.from_user.id}")
+
+
+async def _ask_autopilot_goal(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        "🎯 *Автопилот*\n\n"
+        "Напишите цель одной фразой. Например:\n"
+        "`500 лайков на https://youtube.com/watch?v=...`\n"
+        "`1000 просмотров на видео ...`\n"
+        "`300 подписчиков на https://t.me/channel`\n\n"
+        "LLM разберёт цель, а бот выберет самую дешёвую подходящую услугу по каталогам бирж.",
+        reply_markup=keyboards.cancel_only(),
+        parse_mode="Markdown",
+    )
+    await state.set_state(AutopilotFSM.goal)
+
+
+@router.message(AutopilotFSM.goal)
+@_require_admin_msg
+async def fsm_autopilot_goal(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    **kwargs: Any,
+) -> None:
+    text = (message.text or "").strip()
+    if text == BTN_CANCEL:
+        await cmd_cancel(message, state, **kwargs)
+        return
+    if not text:
+        await message.answer("Цель не может быть пустой.", reply_markup=keyboards.cancel_only())
+        return
+    await state.clear()
+    await _run_autopilot_goal(message, settings, text, actor=f"tg:{message.from_user.id}")
+
+
+async def _run_autopilot_goal(
+    message: Message,
+    settings: Settings,
+    goal_text: str,
+    *,
+    actor: str,
+) -> None:
+    await init_db(settings)
+    await message.answer("🎯 Разбираю цель через LLM и сравниваю каталоги бирж...")
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as http_client:
+        adapters = _build_adapters(settings, dry_run=settings.dry_run, http_client=http_client)
+        planner = OllamaPlanner(
+            base_url=settings.ollama_base_url,
+            model=settings.ollama_model,
+            http_client=http_client,
+            timeout_seconds=settings.ollama_timeout_seconds,
+        )
+        runner = AutopilotRunner(settings, adapters, planner)
+        result = await runner.run_goal(goal_text, actor=actor)
+    await message.answer(format_autopilot_result(result), reply_markup=keyboards.main_menu())
 
 
 # ---------------------------------------------------------------------------

@@ -119,11 +119,12 @@ async def test_start_shows_main_menu_and_clears_state(
     assert len(msg.answers) == 1
     text, kb = msg.answers[0]
     assert "Бот мониторинга бирж" in text
-    # Reply keyboard is attached and contains all 9 main-menu buttons.
+    # Reply keyboard is attached and contains all main-menu buttons.
     assert kb is not None
     labels = {btn.text for row in kb.keyboard for btn in row}
     for expected in (
         keyboards.BTN_NEW_ORDER,
+        keyboards.BTN_AUTOPILOT,
         keyboards.BTN_BALANCE,
         keyboards.BTN_DASHBOARD,
         keyboards.BTN_ORDERS,
@@ -490,29 +491,32 @@ async def test_accept_callback_admin_calls_decide(monkeypatch, settings: Setting
 
 
 def test_main_menu_keyboard_layout() -> None:
-    """Main menu has 9 buttons across 5 rows: 4 pairs + a final single-button
-    row for Cancel. Money-relevant actions (Новый заказ, Баланс) are pinned to
-    the top row.
+    """Main menu keeps the LLM goal and manual order entry on the top row.
+
+    Cancel remains isolated on the final row so accidental cancellation is
+    harder during daily operator work.
     """
     kb = keyboards.main_menu()
-    assert len(kb.keyboard) == 5
+    assert len(kb.keyboard) == 6
     # First four rows are pairs.
     for row in kb.keyboard[:4]:
         assert len(row) == 2
+    assert len(kb.keyboard[4]) == 1
     # Last row is the single Cancel button.
     assert len(kb.keyboard[-1]) == 1
     assert kb.keyboard[-1][0].text == keyboards.BTN_CANCEL
-    # Top row holds the money-relevant actions.
+    # Top row holds the two order-entry paths.
     top_row_labels = {btn.text for btn in kb.keyboard[0]}
+    assert keyboards.BTN_AUTOPILOT in top_row_labels
     assert keyboards.BTN_NEW_ORDER in top_row_labels
-    assert keyboards.BTN_BALANCE in top_row_labels
 
 
-def test_scenario_choice_keyboard_has_three_choices_plus_cancel() -> None:
+def test_scenario_choice_keyboard_has_four_choices_plus_cancel() -> None:
     kb = keyboards.scenario_choice()
     callback_data = [btn.callback_data for row in kb.inline_keyboard for btn in row]
     assert "no:scenario:activity_subscribe" in callback_data
     assert "no:scenario:activity_like" in callback_data
+    assert "no:scenario:activity_view" in callback_data
     assert "no:scenario:social_traffic" in callback_data
     assert "no:cancel" in callback_data
 

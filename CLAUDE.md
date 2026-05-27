@@ -4,10 +4,10 @@
 
 ## Что это
 
-Task Monitoring Bot — коммерческий Telegram-бот, который ведёт lifecycle заказов
-на SMM-панелях и биржах микрозадач:
+Task Monitoring Bot — коммерческий Telegram-бот с LLM-автопилотом, который ведёт
+lifecycle заказов на SMM-панелях и биржах микрозадач:
 
-`создать заказ -> мониторить -> проверить результат -> принять / вернуть -> отчитаться`
+`цель пользователя -> Ollama -> выбор услуги по цене -> создать -> проверить -> отчитаться`
 
 Публичный репозиторий не содержит клиентские секреты, рабочие цели и приватные
 детали. Всё окружение задаётся через `.env`.
@@ -29,6 +29,7 @@ Task Monitoring Bot — коммерческий Telegram-бот, который
 
 ```text
 adapters/        интеграции с биржами
+autopilot/       Ollama planner, selector, goal runner
 bot/             Telegram handlers и keyboards
 db/              schema, WAL, claim helpers, audit log
 verification/   TrafficVerifier и ActivityVerifier
@@ -101,7 +102,18 @@ models.py       доменные модели и статусы
 |---|---|
 | Подписки | `Scenario.ACTIVITY_SUBSCRIBE` |
 | Лайки | `Scenario.ACTIVITY_LIKE` |
+| Просмотры | `Scenario.ACTIVITY_VIEW` |
 | Трафик из соцсетей | `Scenario.SOCIAL_TRAFFIC` |
+
+## LLM Autopilot
+
+- Ollama endpoint: `POST /api/chat`.
+- Config: `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `OLLAMA_TIMEOUT_SECONDS`.
+- Structured output model: `AutopilotIntent`.
+- LLM only parses the user's goal. Exchange/service selection is deterministic:
+  adapters return `ServiceOption`, `AutopilotRunner` picks the cheapest candidate
+  that fits quantity and max_cost.
+- In `DRY_RUN=true`, autopilot returns a plan and does not call exchange create APIs.
 
 Источник трафика задаётся через `SourcePlatform`: VK, X, YouTube, Telegram, Dzen,
 Pinterest.
@@ -130,6 +142,7 @@ Pinterest.
 
 ```bash
 python cli.py smoke
+python cli.py autopilot --goal "500 лайков на https://youtube.com/watch?v=..." --plan-only
 python cli.py monitor --dry-run
 python cli.py verify ...
 python cli.py create-order ...

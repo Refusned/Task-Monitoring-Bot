@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     target_website_url: str = ""
     target_social_accounts: list[str] = []
 
+    # LLM autopilot (Ollama-compatible /api/chat)
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "llama3.1"
+    ollama_timeout_seconds: float = Field(default=30.0, ge=1)
+    autopilot_candidate_limit_per_exchange: int = Field(default=8, ge=1)
+
 
 def get_settings() -> Settings:
     """Instantiate settings; pydantic-settings reads .env and the environment."""
