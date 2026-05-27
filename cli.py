@@ -362,6 +362,37 @@ async def autopilot_command(settings: Settings, args: argparse.Namespace) -> int
     return 0 if result.status in {"created", "planned", "dry_run"} else 1
 
 
+def dashboard_command(settings: Settings, args: argparse.Namespace) -> int:
+    """Run the browser dashboard."""
+    import uvicorn
+
+    from web_dashboard.app import create_app
+
+    host = args.host or settings.web_dashboard_host
+    port = args.port or settings.web_dashboard_port
+    effective_settings = settings.model_copy(
+        update={
+            "web_dashboard_host": host,
+            "web_dashboard_port": port,
+        }
+    )
+    if not effective_settings.web_dashboard_token and not _is_loopback_host(host):
+        print(
+            "[dashboard] WEB_DASHBOARD_TOKEN is required when binding outside localhost",
+            file=sys.stderr,
+        )
+        return 2
+    if not effective_settings.web_dashboard_token:
+        print("[dashboard] WEB_DASHBOARD_TOKEN is empty; allowing localhost-only access")
+    print(f"[dashboard] starting at http://{host}:{port}")
+    uvicorn.run(create_app(lambda: effective_settings), host=host, port=port, log_level="info")
+    return 0
+
+
+def _is_loopback_host(host: str) -> bool:
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
 # --- argparse / dispatch ------------------------------------------------------
 
 
@@ -383,6 +414,13 @@ def _build_parser() -> argparse.ArgumentParser:
     dry_group_verify.add_argument("--live", dest="dry_run", action="store_false")
 
     sub.add_parser("demo", help="Full DRY_RUN lifecycle demo (create + poll + verify)")
+
+    p_dashboard = sub.add_parser(
+        "dashboard",
+        help="Run the browser dashboard for bot operations",
+    )
+    p_dashboard.add_argument("--host", help="Bind host, defaults to WEB_DASHBOARD_HOST")
+    p_dashboard.add_argument("--port", type=int, help="Bind port, defaults to WEB_DASHBOARD_PORT")
 
     p_autopilot = sub.add_parser(
         "autopilot",
@@ -466,6 +504,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(verify_command(settings, args))
     if args.command == "autopilot":
         return asyncio.run(autopilot_command(settings, args))
+    if args.command == "dashboard":
+        return dashboard_command(settings, args)
     if args.command == "demo":
         return asyncio.run(demo_command(settings, args))
     return 2  # unreachable - argparse requires command

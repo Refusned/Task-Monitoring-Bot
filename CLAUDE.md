@@ -32,11 +32,12 @@ adapters/        интеграции с биржами
 autopilot/       Ollama planner, selector, goal runner
 bot/             Telegram handlers и keyboards
 db/              schema, WAL, claim helpers, audit log
+web_dashboard/   FastAPI dashboard and browser UI
 verification/   TrafficVerifier и ActivityVerifier
 reporting/      Google Sheets export
 posts/          watcher новых постов
 tests/          unit, integration, fault-injection, live smoke
-cli.py          smoke / monitor / verify / create-order
+cli.py          smoke / monitor / verify / create-order / dashboard
 main.py         Telegram polling + scheduler
 orchestrator.py state machine, C1/C2, audit
 config.py       pydantic-settings
@@ -148,6 +149,7 @@ Pinterest.
 ```bash
 python cli.py smoke
 python cli.py autopilot --goal "500 лайков на https://youtube.com/watch?v=..." --plan-only
+python cli.py dashboard
 python cli.py monitor --dry-run
 python cli.py verify ...
 python cli.py create-order ...

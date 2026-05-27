@@ -34,6 +34,7 @@ bot.pid
 # Testing / linting caches
 .pytest_cache/
 .ruff_cache/
+.playwright-cli/
 .mypy_cache/
 .coverage
 htmlcov/

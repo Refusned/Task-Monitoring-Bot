@@ -60,6 +60,11 @@ class Settings(BaseSettings):
     ollama_timeout_seconds: float = Field(default=30.0, ge=1)
     autopilot_candidate_limit_per_exchange: int = Field(default=8, ge=1)
 
+    # Browser dashboard
+    web_dashboard_host: str = "127.0.0.1"
+    web_dashboard_port: int = Field(default=8080, ge=1, le=65535)
+    web_dashboard_token: str = ""
+
 
 def get_settings() -> Settings:
     """Instantiate settings; pydantic-settings reads .env and the environment."""

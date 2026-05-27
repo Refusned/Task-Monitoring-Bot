@@ -17,6 +17,8 @@ dependencies = [
     "gspread>=6.0",
     "google-auth>=2.29",
     "typer>=0.12",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
 ]
 
 [project.optional-dependencies]
@@ -28,7 +30,16 @@ dev = [
 
 [tool.setuptools]
 py-modules = ["config", "models", "cli", "conftest", "main"]
-packages = ["db", "adapters", "autopilot", "bot", "posts", "reporting", "verification"]
+packages = [
+    "db",
+    "adapters",
+    "autopilot",
+    "bot",
+    "posts",
+    "reporting",
+    "verification",
+    "web_dashboard",
+]
 
 [tool.ruff]
 line-length = 100

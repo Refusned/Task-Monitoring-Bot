@@ -25,13 +25,13 @@
 | Вести уже созданные заказы | Импорт по `external_order_id` и общий lifecycle |
 | Проверять результат независимо | `TrafficVerifier` и `ActivityVerifier` |
 | Защищать денежные действия | C1/C2-инварианты, лимиты, audit log |
-| Дать удобный интерфейс оператору | Telegram FSM, reply/inline keyboards, CLI для техподдержки |
+| Дать удобный интерфейс оператору | Telegram FSM, browser dashboard, CLI для техподдержки |
 | Делать недельный отчёт | SQLite `report_rows` -> Google Sheets |
 
 ## Архитектура
 
 ```text
-Telegram bot + CLI
+Telegram bot + CLI + Browser dashboard
        |
        v
 LLM Autopilot
@@ -100,6 +100,21 @@ poll_active_orders / poll_new_posts / weekly_report
 
 LLM не выбирает биржу и не получает API-ключи. Это намеренное разделение: модель
 понимает фразу пользователя, код отвечает за деньги.
+
+### Browser Dashboard
+
+`web_dashboard/` даёт оператору web-интерфейс поверх тех же доменных сервисов, что
+используют Telegram и CLI:
+
+- сводка по заказам, расходу, сабмишенам и audit log;
+- запуск LLM-автопилота в режиме плана или создания заказа;
+- ручной `poll_all` и `verify_single_order`;
+- список заказов с деталями, последними проверками и событиями;
+- очередь `awaiting_admin` с accept/rework через C2-safe методы orchestrator;
+- недельный report preview, health-check и балансы бирж.
+
+API закрывается `WEB_DASHBOARD_TOKEN`, когда dashboard нужен не только на localhost.
+Без токена команда запуска разрешена только для loopback-хоста.
 
 ## Money-safety
 
