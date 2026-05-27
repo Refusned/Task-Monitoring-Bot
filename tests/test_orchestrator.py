@@ -113,7 +113,7 @@ async def test_panel_lifecycle(db: Settings) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.skip(reason="Simulated adapter lifecycle was removed")
-async def test_task_exchange_submissions(db: Settings) -> None:
+async def test_microtask_exchange_submissions(db: Settings) -> None:
     adapters = _make_adapters()
     spec = _make_order_spec(Scenario.SOCIAL_TRAFFIC)
     client_uuid = "task-uuid-1"
@@ -143,7 +143,7 @@ async def test_task_exchange_submissions(db: Settings) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.skip(reason="Simulated adapter lifecycle was removed")
-async def test_task_exchange_accept_reject(db: Settings) -> None:
+async def test_microtask_exchange_accept_reject(db: Settings) -> None:
     adapters = _make_adapters()
     spec = _make_order_spec(Scenario.SOCIAL_TRAFFIC)
     client_uuid = "task-uuid-2"
@@ -213,7 +213,7 @@ async def test_c2_no_double_pay(db: Settings) -> None:
 
     # Force re-run of resolution to test duplicate guard
     task_adapter = adapters["unu"]
-    
+
     assert task_adapter is not None
     async with connect(db) as conn:
         subs = await get_submissions_for_order(conn, client_uuid)

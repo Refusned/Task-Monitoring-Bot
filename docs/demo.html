@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Task Monitoring Bot — демонстрация</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root {
+    --bg:        #f7f7f5;
+    --card:      #ffffff;
+    --ink:       #15171a;
+    --muted:     #6b7280;
+    --accent:    #0d6efd;
+    --accent-soft:#e7f0ff;
+    --border:    #e7e7e3;
+    --good:      #16a34a;
+    --warn:      #d97706;
+    --danger:    #dc2626;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui,
+                 "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 22px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .deck {
+    position: relative;
+    height: 100vh;
+    overflow: hidden;
+  }
+  .slide {
+    position: absolute; inset: 0;
+    display: none;
+    padding: 5vh 8vw;
+    overflow-y: auto;
+  }
+  .slide.active { display: flex; flex-direction: column; justify-content: center; }
+
+  /* Header & meta */
+  .eyebrow {
+    color: var(--accent);
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-size: 0.78em;
+    margin-bottom: 0.4em;
+  }
+  h1 { font-size: 3em;    margin: 0 0 0.3em; font-weight: 700; letter-spacing: -0.02em; }
+  h2 { font-size: 2.1em;  margin: 0 0 0.4em; font-weight: 700; letter-spacing: -0.02em; }
+  h3 { font-size: 1.35em; margin: 0 0 0.5em; font-weight: 600; }
+  p  { line-height: 1.5; color: var(--ink); max-width: 60ch; }
+  .subtitle { color: var(--muted); font-size: 1.15em; line-height: 1.45; max-width: 60ch; }
+
+  /* Cards */
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    padding: 1.4em 1.6em;
+    box-shadow: 0 1px 0 rgba(0,0,0,0.02);
+  }
+  .card + .card { margin-top: 1em; }
+
+  /* Two-column layout */
+  .two-col {
+    display: grid;
+    grid-template-columns: 1.1fr 1fr;
+    gap: 2em;
+    margin-top: 0.8em;
+  }
+  .two-col .card { margin: 0; }
+
+  /* Lists */
+  ul.bullets {
+    list-style: none; padding: 0; margin: 0;
+  }
+  ul.bullets li {
+    padding: 0.45em 0 0.45em 1.6em;
+    position: relative;
+    line-height: 1.5;
+  }
+  ul.bullets li::before {
+    content: "";
+    position: absolute; left: 0.35em; top: 1em;
+    width: 6px; height: 6px;
+    background: var(--accent); border-radius: 50%;
+  }
+
+  /* Menu mockup (slide 3) */
+  .menu-mock {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.7em;
+    max-width: 480px;
+  }
+  .menu-mock .btn {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 0.9em 1em;
+    text-align: center;
+    font-weight: 500;
+    font-size: 1.05em;
+  }
+  .menu-mock .btn.full { grid-column: 1 / -1; }
+
+  /* Step list (slide 6) */
+  ol.steps {
+    list-style: none;
+    padding: 0; margin: 1em 0 0;
+    counter-reset: step;
+  }
+  ol.steps li {
+    counter-increment: step;
+    padding: 0.6em 0 0.6em 2.4em;
+    position: relative;
+    line-height: 1.45;
+  }
+  ol.steps li::before {
+    content: counter(step);
+    position: absolute; left: 0; top: 0.5em;
+    width: 1.7em; height: 1.7em;
+    border-radius: 50%;
+    background: var(--accent-soft); color: var(--accent);
+    font-weight: 700; font-size: 0.85em;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  ol.steps li b { color: var(--ink); }
+  ol.steps li small { color: var(--muted); display: block; font-size: 0.88em; margin-top: 0.15em; }
+
+  /* Tag chips */
+  .chips { display: flex; flex-wrap: wrap; gap: 0.5em; margin-top: 1em; }
+  .chip {
+    display: inline-block;
+    padding: 0.35em 0.85em;
+    background: var(--accent-soft); color: var(--accent);
+    border-radius: 999px;
+    font-size: 0.92em; font-weight: 500;
+  }
+  .chip.good { background: #dcfce7; color: var(--good); }
+  .chip.warn { background: #fef3c7; color: var(--warn); }
+  .chip.muted { background: #f3f4f6; color: var(--muted); }
+
+  /* Footer / nav */
+  .nav {
+    position: fixed;
+    bottom: 1.4em; left: 0; right: 0;
+    display: flex; justify-content: center; align-items: center; gap: 1.5em;
+    pointer-events: none;
+    font-size: 0.85em;
+    color: var(--muted);
+  }
+  .nav .dot {
+    width: 8px; height: 8px;
+    background: #d4d4d2; border-radius: 50%;
+    cursor: pointer; pointer-events: auto;
+    transition: background 0.2s, transform 0.2s;
+  }
+  .nav .dot.active { background: var(--accent); transform: scale(1.4); }
+  .counter {
+    position: fixed; bottom: 1.4em; right: 1.8em;
+    font-size: 0.85em; color: var(--muted); font-variant-numeric: tabular-nums;
+  }
+  .hint {
+    position: fixed; top: 1.4em; right: 1.8em;
+    font-size: 0.78em; color: var(--muted);
+    background: rgba(255,255,255,0.85);
+    padding: 0.4em 0.9em; border-radius: 999px;
+    border: 1px solid var(--border);
+  }
+  .hint kbd {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 4px; padding: 0.1em 0.4em; font-family: inherit;
+  }
+
+  /* Headline slides */
+  .title-slide {
+    align-items: flex-start;
+  }
+  .title-slide h1 {
+    font-size: 4.2em;
+    line-height: 1;
+  }
+  .title-slide .subtitle { font-size: 1.5em; max-width: 70ch; }
+  .meta {
+    margin-top: 2.5em;
+    color: var(--muted);
+    font-size: 0.95em;
+  }
+
+  /* Big number callouts */
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1em; margin-top: 1.5em; }
+  .stat .num { font-size: 2.4em; font-weight: 700; color: var(--accent); line-height: 1; }
+  .stat .lbl { color: var(--muted); margin-top: 0.4em; font-size: 0.95em; }
+
+  /* Highlight box */
+  .highlight {
+    background: var(--accent-soft);
+    border-left: 4px solid var(--accent);
+    padding: 1em 1.2em;
+    border-radius: 0 12px 12px 0;
+    margin-top: 1em;
+    color: var(--ink);
+  }
+
+  @media (max-width: 900px) {
+    body { font-size: 18px; }
+    .slide { padding: 4vh 5vw; }
+    .two-col { grid-template-columns: 1fr; }
+    .menu-mock { grid-template-columns: 1fr; max-width: 100%; }
+    h1 { font-size: 2.2em; }
+    h2 { font-size: 1.7em; }
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .title-slide h1 { font-size: 2.8em; }
+  }
+</style>
+</head>
+<body>
+
+<div class="hint">
+  Навигация: <kbd>→</kbd> <kbd>←</kbd> <kbd>Space</kbd>
+</div>
+<div class="counter" id="counter">1 / 13</div>
+
+<div class="deck" id="deck">
+
+  <!-- SLIDE 1: TITLE -->
+  <section class="slide title-slide active">
+    <div class="eyebrow">Демонстрация продукта</div>
+    <h1>Task Monitoring Bot</h1>
+    <p class="subtitle">
+      Telegram-бот, который ведёт весь жизненный цикл заказов на 5 биржах накрутки и микрозадач:
+      создаёт заказы, мониторит выполнение, независимо проверяет результат и оплачивает или возвращает на доработку.
+    </p>
+    <div class="stats">
+      <div class="stat"><div class="num">5</div><div class="lbl">бирж интегрировано</div></div>
+      <div class="stat"><div class="num">systemd</div><div class="lbl">готов к сервисному деплою</div></div>
+      <div class="stat"><div class="num">201</div><div class="lbl">автотестов проходит</div></div>
+      <div class="stat"><div class="num">3</div><div class="lbl">уровня защиты денег</div></div>
+    </div>
+    <div class="meta">Service deploy · @monitoring_tasks_bot · открытый код на GitHub</div>
+  </section>
+
+  <!-- SLIDE 2: WHAT IT DOES -->
+  <section class="slide">
+    <div class="eyebrow">Что делает бот</div>
+    <h2>Полный цикл заказа — без ручной рутины</h2>
+    <ol class="steps">
+      <li><b>Создаёт заказ.</b><small>Пошаговый мастер на кнопках, без печатания.</small></li>
+      <li><b>Размещает на бирже.</b><small>Сам обращается к API нужной биржи, считает цену до отправки.</small></li>
+      <li><b>Мониторит статус.</b><small>Опрашивает биржу по расписанию, не пропускает ничего.</small></li>
+      <li><b>Независимо проверяет результат.</b><small>Через Яндекс.Метрику или счётчики активности — не доверяет статусу биржи.</small></li>
+      <li><b>Принимает или возвращает.</b><small>Хорошая работа — оплата. Слабая — возврат на доработку.</small></li>
+      <li><b>Раз в неделю — отчёт.</b><small>Сводка автоматически в Google Sheets, без напоминаний.</small></li>
+    </ol>
+  </section>
+
+  <!-- SLIDE 3: MAIN MENU -->
+  <section class="slide">
+    <div class="eyebrow">Главное меню</div>
+    <h2>9 кнопок — всё что нужно для управления</h2>
+    <p class="subtitle">Меню всегда видно под полем ввода. Открываете бота — сразу можете начать работать.</p>
+    <div class="two-col">
+      <div class="card">
+        <div class="menu-mock">
+          <div class="btn">📦 Новый заказ</div>
+          <div class="btn">💰 Баланс</div>
+          <div class="btn">📊 Сводка</div>
+          <div class="btn">📋 Заказы</div>
+          <div class="btn">🔎 Проверить</div>
+          <div class="btn">🧾 На проверку</div>
+          <div class="btn">📄 Отчёт</div>
+          <div class="btn">🩺 Здоровье</div>
+          <div class="btn full">❌ Отмена</div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Удобство</h3>
+        <ul class="bullets">
+          <li>Всё на кнопках — ничего не нужно запоминать</li>
+          <li>Денежные действия — на верхней строке, под рукой</li>
+          <li>Любой шаг можно отменить одной кнопкой</li>
+          <li>Доступ только у админа — посторонним бот не ответит</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- SLIDE 4: BALANCE -->
+  <section class="slide">
+    <div class="eyebrow">Кнопка</div>
+    <h2>💰 Баланс</h2>
+    <p class="subtitle">Сколько денег осталось на каждой бирже — одним тапом, в реальном времени.</p>
+    <div class="card">
+      <h3>Что увидите</h3>
+      <ul class="bullets">
+        <li>Живой баланс по каждой бирже, отдельной строкой</li>
+        <li>Зелёная галочка — биржа отвечает, цифра свежая</li>
+        <li>Серая отметка — биржа не предоставляет API для баланса (например, advego). Показываем честно, без подделок</li>
+        <li>Если один сервис упал — балансы остальных всё равно покажутся</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- SLIDE 5: HEALTH -->
+  <section class="slide">
+    <div class="eyebrow">Кнопка</div>
+    <h2>🩺 Здоровье</h2>
+    <p class="subtitle">Состояние всех интеграций на одном экране. Подходит для ежедневной проверки «всё ли работает».</p>
+    <div class="card">
+      <h3>Что увидите</h3>
+      <ul class="bullets">
+        <li>Каждая биржа — настроена или нет</li>
+        <li>Яндекс.Метрика и Google&nbsp;Sheets — подключены или нет</li>
+        <li>Текущий режим: <b>LIVE</b> (реальные деньги) или <b>DRY&nbsp;RUN</b> (тренировочный, без денег)</li>
+      </ul>
+      <div class="highlight">
+        Бот честно показывает то что есть. Не выводит зелёную галочку, если интеграция не настроена.
+      </div>
+    </div>
+  </section>
+
+  <!-- SLIDE 6: NEW ORDER -->
+  <section class="slide">
+    <div class="eyebrow">Кнопка</div>
+    <h2>📦 Новый заказ</h2>
+    <p class="subtitle">Пошаговый мастер. Каждый шаг — выбор кнопкой, никаких сложных форм.</p>
+    <ol class="steps">
+      <li><b>Сценарий</b><small>Подписки · Лайки · Трафик из соцсетей</small></li>
+      <li><b>Биржа</b><small>smmcode · prskill · unu · advego · ipgold</small></li>
+      <li><b>Услуга из каталога</b><small>Бот сам тянет актуальный каталог биржи, фильтрует по сценарию и показывает топ услуг с реальными ценами</small></li>
+      <li><b>Целевой URL</b><small>Ссылка на сайт, аккаунт или пост</small></li>
+      <li><b>Количество</b><small>Сколько действий заказываем</small></li>
+      <li><b>Подтверждение</b><small>Карточка-предпросмотр со всеми параметрами и итоговой ценой. Заказ уходит на биржу только после явного «Подтвердить»</small></li>
+    </ol>
+  </section>
+
+  <!-- SLIDE 7: ORDERS -->
+  <section class="slide">
+    <div class="eyebrow">Кнопка</div>
+    <h2>📋 Заказы</h2>
+    <p class="subtitle">Список всех активных заказов. Кликабельный — каждая строка раскрывается в детальную карточку.</p>
+    <div class="card">
+      <h3>Что увидите</h3>
+      <ul class="bullets">
+        <li>Список заказов: статус, биржа, сценарий, количество, цель</li>
+        <li>Тап по заказу — карточка с полной информацией и кнопкой «Обновить статус»</li>
+        <li>«Обновить» — бот заново опрашивает биржу и показывает свежее состояние</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- SLIDE 8: REVIEW -->
+  <section class="slide">
+    <div class="eyebrow">Кнопка</div>
+    <h2>🧾 На проверку</h2>
+    <p class="subtitle">Очередь сабмишенов от исполнителей, по которым нужно принять решение лично.</p>
+    <div class="two-col">
+      <div class="card">
+        <h3>Когда сюда что-то приходит</h3>
+        <ul class="bullets">
+          <li>Исполнитель сдал работу на бирже микрозадач</li>
+          <li>Бот независимо проверил результат</li>
+          <li>Результат на грани — нужно человеческое решение</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Две кнопки</h3>
+        <ul class="bullets">
+          <li><b>✅ Принять</b> — оплата уходит исполнителю</li>
+          <li><b>❌ Вернуть на доработку</b> — деньги не тратятся, исполнитель переделывает</li>
+        </ul>
+        <div class="highlight">Двойной клик невозможен — защита на уровне базы данных.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SLIDE 9: CHECK -->
+  <section class="slide">
+    <div class="eyebrow">Кнопка</div>
+    <h2>🔎 Проверить</h2>
+    <p class="subtitle">Принудительный опрос всех активных заказов прямо сейчас.</p>
+    <div class="card">
+      <ul class="bullets">
+        <li>По расписанию бот опрашивает биржи автоматически каждые 5 минут</li>
+        <li>Если хочется свежие данные не дожидаясь — нажимаете кнопку и получаете отчёт по всем заказам</li>
+        <li>Удобно перед звонком клиенту или важным решением</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- SLIDE 10: REPORT -->
+  <section class="slide">
+    <div class="eyebrow">Кнопка</div>
+    <h2>📄 Отчёт</h2>
+    <p class="subtitle">Еженедельная сводка по трафику из соцсетей — автоматически в Google&nbsp;Sheets.</p>
+    <div class="card">
+      <h3>Как это работает</h3>
+      <ul class="bullets">
+        <li>Каждый понедельник в 9:00 бот собирает данные за прошлую неделю и пишет в Google Sheets, вкладка «Трафик из соц сетей»</li>
+        <li>Колонки: неделя · платформа-источник · биржа · заказано · фактически · стоимость · статус</li>
+        <li>В боте — кнопка для предпросмотра текущей недели до отправки</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- SLIDE 11: DASHBOARD -->
+  <section class="slide">
+    <div class="eyebrow">Кнопка</div>
+    <h2>📊 Сводка</h2>
+    <p class="subtitle">Быстрый обзор всей системы — для понимания общей картины.</p>
+    <div class="card">
+      <ul class="bullets">
+        <li>Сколько заказов в каждом статусе</li>
+        <li>Сколько сабмишенов ждёт решения</li>
+        <li>Сколько потрачено сегодня</li>
+        <li>Сколько ещё можно потратить (дневной лимит)</li>
+        <li>Текущий режим работы — LIVE или DRY RUN</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- SLIDE 12: MONEY SAFETY -->
+  <section class="slide">
+    <div class="eyebrow">Под капотом</div>
+    <h2>🛡 Деньги под защитой на трёх уровнях</h2>
+    <div class="card">
+      <ol class="steps">
+        <li><b>Лимиты на траты</b><small>Лимит на один заказ и дневной лимит. Превышение — заказ не уходит на биржу.</small></li>
+        <li><b>Подтверждение админа</b><small>Перед каждой денежной операцией — явная кнопка «Подтвердить». Никаких автоматических списаний.</small></li>
+        <li><b>Проверка цены до отправки</b><small>Бот сначала спрашивает у биржи актуальную цену по каталогу, считает итог, и только потом отправляет заказ. Если получается дороже — отказывает сразу.</small></li>
+      </ol>
+      <div class="highlight">
+        Заказ не может уйти дважды, сабмишен не может быть оплачен повторно — защита на уровне базы данных, не только в логике.
+      </div>
+    </div>
+  </section>
+
+  <!-- SLIDE 13: CLOSING -->
+  <section class="slide title-slide">
+    <div class="eyebrow">Итог</div>
+    <h1>Готов к работе</h1>
+    <p class="subtitle">
+      Бот подготовлен к production-запуску через отдельный сервис и управляется из Telegram.
+      Все 5 бирж интегрированы и проверены. Безопасность денег обеспечена на нескольких уровнях.
+      Дальнейшее развитие — точечные доработки по вашим запросам.
+    </p>
+    <div class="chips">
+      <span class="chip good">✓ 5 бирж</span>
+      <span class="chip good">✓ Service deploy</span>
+      <span class="chip good">✓ Защита денег</span>
+      <span class="chip good">✓ Независимая проверка</span>
+      <span class="chip good">✓ Автоматические отчёты</span>
+      <span class="chip good">✓ Открытый код</span>
+    </div>
+    <div class="meta">Готов отвечать на вопросы.</div>
+  </section>
+
+</div>
+
+<div class="nav" id="nav"></div>
+
+<script>
+  const slides  = document.querySelectorAll('.slide');
+  const dotsBox = document.getElementById('nav');
+  const counter = document.getElementById('counter');
+  let idx = 0;
+
+  // Build dot navigation
+  slides.forEach((_, i) => {
+    const d = document.createElement('div');
+    d.className = 'dot' + (i === 0 ? ' active' : '');
+    d.addEventListener('click', () => go(i));
+    dotsBox.appendChild(d);
+  });
+  const dots = dotsBox.querySelectorAll('.dot');
+
+  function go(n) {
+    n = Math.max(0, Math.min(slides.length - 1, n));
+    slides[idx].classList.remove('active');
+    dots[idx].classList.remove('active');
+    idx = n;
+    slides[idx].classList.add('active');
+    dots[idx].classList.add('active');
+    counter.textContent = (idx + 1) + ' / ' + slides.length;
+    // Scroll to top of slide content
+    slides[idx].scrollTop = 0;
+  }
+  function next() { go(idx + 1); }
+  function prev() { go(idx - 1); }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'PageDown') { e.preventDefault(); next(); }
+    else if (e.key === 'ArrowLeft' || e.key === 'PageUp')                { e.preventDefault(); prev(); }
+    else if (e.key === 'Home')                                            { e.preventDefault(); go(0); }
+    else if (e.key === 'End')                                             { e.preventDefault(); go(slides.length - 1); }
+  });
+
+  // Click on the right half = next, left half = prev (only when no text is selected)
+  document.getElementById('deck').addEventListener('click', (e) => {
+    if (window.getSelection().toString().length) return;
+    if (e.target.closest('.nav, .hint, .counter')) return;
+    const w = window.innerWidth;
+    if (e.clientX > w / 2) next(); else prev();
+  });
+
+  // Init counter
+  counter.textContent = '1 / ' + slides.length;
+</script>
+
+</body>
+</html>

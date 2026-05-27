@@ -308,8 +308,7 @@ async def demo_command(settings: Settings, args: argparse.Namespace) -> int:
     """Explain why the old simulated lifecycle is no longer available."""
     print("[demo] disabled: simulated exchanges were removed.")
     print(
-        "[demo] use `smoke` for local wiring checks or "
-        "`monitor --dry-run` for read-only polling."
+        "[demo] use `smoke` for local wiring checks or `monitor --dry-run` for read-only polling."
     )
     return 0
 

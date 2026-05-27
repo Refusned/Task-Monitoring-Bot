@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class Scenario(StrEnum):
-    """The two MVP scenarios from the test task."""
+    """Client-facing order scenarios supported by the bot."""
 
     ACTIVITY_SUBSCRIBE = "activity_subscribe"
     ACTIVITY_LIKE = "activity_like"
@@ -18,7 +18,7 @@ class Scenario(StrEnum):
 
 
 class SourcePlatform(StrEnum):
-    """A8 - six traffic source platforms named in the task."""
+    """Traffic source platforms supported by the reporting flow."""
 
     VK = "vk"
     X = "x"

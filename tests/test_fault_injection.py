@@ -470,6 +470,7 @@ async def test_poll_all_isolates_failures_per_order(settings):
     uuid_b = await seed(spec_b, "ext-smmcode-1")
 
     boom = _FullyBoomAdapter(RuntimeError("boom!"))
+
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/order_status"):
             return httpx.Response(200, json={"status": 200, "order": {"status_id": 3}})

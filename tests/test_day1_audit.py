@@ -203,7 +203,7 @@ async def test_panel_adapter_refuses_over_max_cost() -> None:
     assert create_called is False
 
 
-async def test_task_exchange_adapter_refuses_over_max_cost() -> None:
+async def test_microtask_exchange_adapter_refuses_over_max_cost() -> None:
     create_called = False
 
     def handler(request: httpx.Request) -> httpx.Response:

@@ -205,7 +205,9 @@ async def test_panel_order_full_lifecycle_via_bot(settings: Settings, state: FSM
 
 @pytest.mark.asyncio
 @pytest.mark.skip(reason="Full dry-run lifecycle simulation was removed with test exchanges")
-async def test_task_exchange_full_lifecycle_via_bot(settings: Settings, state: FSMContext) -> None:
+async def test_microtask_exchange_full_lifecycle_via_bot(
+    settings: Settings, state: FSMContext
+) -> None:
     # 1. New order via FSM: SOCIAL_TRAFFIC → unu → VK
     await handlers.reply_new_order(_FakeMessage(), state, settings=settings)
     await handlers.cb_scenario(_FakeQuery("no:scenario:social_traffic"), state, settings=settings)

@@ -67,8 +67,7 @@ class PrskillAdapter(PanelAdapter):
 
     async def get_balance(self) -> float:
         raise NotImplementedError(
-            "prskill API does not expose a balance endpoint; track balance "
-            "via the web cabinet"
+            "prskill API does not expose a balance endpoint; track balance via the web cabinet"
         )
 
     async def create_order(self, spec: OrderSpec, client_order_uuid: str) -> tuple[str, float]:

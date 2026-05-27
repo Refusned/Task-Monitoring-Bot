@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "exchange-monitor-bot"
 version = "0.1.0"
-description = "Bot for managing the order lifecycle on SMM / microtask exchanges (test task)"
+description = "Commercial Telegram bot for managing SMM and microtask exchange order lifecycles"
 requires-python = ">=3.11"
 dependencies = [
     "aiogram>=3.4,<4",

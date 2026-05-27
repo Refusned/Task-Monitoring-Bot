@@ -1,233 +1,265 @@
 <div align="center">
 
-# 🤖 Task Monitoring Bot
+# Task Monitoring Bot
 
-**Production-ready Telegram-бот, ведущий жизненный цикл заказов на 5 биржах накрутки и микрозадач.**
+**Коммерческий Telegram-бот для управления заказами на SMM-панелях и биржах микрозадач.**
 
-`создаёт заказы → мониторит → независимо проверяет результат → оплачивает или возвращает на доработку`
+`создание заказов -> мониторинг -> независимая проверка -> принятие / возврат -> отчётность`
 
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![aiogram](https://img.shields.io/badge/aiogram-3.x-2CA5E0?logo=telegram&logoColor=white)](https://docs.aiogram.dev/)
-[![Tests](https://img.shields.io/badge/tests-187%20passing-brightgreen)](#-тесты)
-[![Lint](https://img.shields.io/badge/ruff-clean-success)](#-качество-кода)
-[![Deployed](https://img.shields.io/badge/deployment-systemd%2024%2F7-blue)](#-деплой)
+[![Tests](https://img.shields.io/badge/tests-201%20passing-brightgreen)](#-качество)
+[![Lint](https://img.shields.io/badge/ruff-clean-success)](#-качество)
+[![Deploy](https://img.shields.io/badge/deploy-systemd-blue)](#-деплой)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
 </div>
 
 ---
 
-## 📖 О проекте
+## О проекте
 
-Бот автоматизирует операционку при работе с биржами **накрутки активности в соцсетях** (подписки, лайки) и **закупки целевого трафика на сайт**. Заказчик описывает заказ в Telegram через интерактивный мастер, бот размещает его на одной из 5 бирж, ведёт мониторинг, независимо проверяет результат (через Яндекс.Метрику или счётчики активности — **не доверяя статусу биржи**) и предлагает оплатить или вернуть на доработку.
+Task Monitoring Bot автоматизирует рутинную работу заказчика с 5 площадками:
+`smmcode.shop`, `prskill.ru`, `unu.im`, `advego.com`, `ipgold.ru`.
 
-Покрытие — **5 бирж**: `smmcode.shop`, `prskill.ru`, `unu.im`, `advego.com`, `ipgold.ru`. Разные API-протоколы: REST/JSON, Perfect Panel form, XML-RPC.
+До этого процесс был ручным: зайти на биржу, создать заказ, дождаться статуса,
+проверить результат в сторонних системах, принять работу или вернуть исполнителю,
+а затем собрать недельный отчёт. Бот забирает этот цикл в Telegram и CLI:
 
-> 🟢 **Текущий статус.** Бот развёрнут как systemd-сервис на выделенном Linux-сервере, работает 24/7, отвечает в Telegram как [@monitoring_tasks_bot](https://t.me/monitoring_tasks_bot). Подтверждённые балансы и каталоги (smmcode: 2934 услуги, unu: 56 тарифов, advego: 27 типов заказов). Размещение реальных заказов разблокируется одним переключателем `DRY_RUN=false`.
+1. Создаёт заказ на нужной площадке.
+2. Мониторит статус по расписанию.
+3. Проверяет результат независимо от статуса биржи.
+4. Даёт администратору безопасно принять работу или вернуть её на доработку.
+5. Собирает еженедельную выгрузку по трафику в Google Sheets.
 
----
-
-## ✨ Что внутри
-
-### Полный жизненный цикл заказа
-| Этап | Что делает бот |
-|---|---|
-| **Создание** | Интерактивный мастер: сценарий → биржа → услуга из каталога → URL → количество → подтверждение. Estimate-first cost-cap до отправки на биржу. |
-| **Мониторинг** | Опрос статуса биржи по расписанию + per-exchange изоляция сбоёв. |
-| **Верификация** | Независимая проверка через Яндекс.Метрику (UTM-фильтр) или дельту счётчиков активности. **Не доверяет** статусу биржи (инвариант A4). |
-| **Оплата / возврат** | Auto-pass / auto-reject по порогам или вынос на ручное решение админа в Telegram. Деньги всегда под защитой C2-инварианта. |
-| **Отчётность** | Еженедельный отчёт в Google Sheets (вкладка «Трафик из соц сетей»). |
-
-### Интерактивный Telegram UX
-- **Reply keyboard** под полем ввода всегда видна: новый заказ, сводка, заказы, проверка, на проверку, отчёт, здоровье, отмена.
-- **Inline-кнопки** на каждом шаге FSM. Ничего печатать не нужно — кроме URL и количества.
-- **Динамический каталог** услуг: после выбора биржи бот тянет её актуальный каталог, фильтрует по сценарию (подписки / лайки / трафик), показывает топ-N с ценами как кнопки.
-- Manual entry fallback для случаев, когда нужного нет в каталоге или биржа недоступна.
-- **Slash-команды как алиасы** для power-users: 10 команд с эмодзи и русскими описаниями в `getMyCommands`.
-
-<details>
-<summary>Скрин Telegram (опционально, после первого реального запроса)</summary>
-
-```
-📦 Новый заказ
-
-Сценарий: activity_subscribe
-Биржа: smmcode
-
-Шаг 3/6 — выберите услугу:
-
-  [Подписчики РФ · ₽0.05/шт · ≥50]
-  [Подписчики со всего мира · ₽0.18/шт · ≥20]
-  [✏️ Ввести ID вручную]
-  [❌ Отмена]
-```
-</details>
+Проект делался как клиентская разработка: с реальными API, реальными ограничениями
+по деньгам и приватными доступами, которые не попадают в репозиторий. Имя клиента,
+ключи и рабочие цели скрыты; публичная версия оставляет архитектуру, тесты и
+демо-режим.
 
 ---
 
-## 🏗 Архитектура
+## Что показывает этот проект
 
-```
- Telegram bot (aiogram 3)        CLI (cli.py)
-    ▼                              ▼
- Reply keyboard + inline FSM     create-order / monitor / verify / smoke
-        └───────────┬─────────────┘
-                    ▼
-        ┌──────────────────────────┐
-        │     Orchestrator         │   State-machine + C1/C2 + audit
-        │  (ACTIVE → VERIFYING →   │
-        │   COMPLETED / FAILED)    │
-        └──────────────────────────┘
-            │           │           │
-   ┌────────┘           │           └─────────┐
-   ▼                    ▼                     ▼
- Adapters         Verification          DB (aiosqlite WAL)
- ─ smmcode        ─ TrafficVerifier      orders · submissions
- ─ prskill        ─ ActivityVerifier     payments(PK) · action_log
- ─ unu                                   verifications · audit_log
- ─ advego                                report_rows · watcher_state
- ─ ipgold (stub)
-                                             ▲
-                                             │
-        ┌────────────────────────────────────┘
-        │
- APScheduler (max_instances=1, coalesce=True)
-   ─ poll_active_orders   (полминуты — конфиг)
-   ─ poll_new_posts       (A3: PostWatcher для «лайки на новые посты»)
-   ─ weekly_report        (понедельник 09:00 UTC → Google Sheets)
-```
+Это не учебный CRUD и не обёртка над одним API. Внутри есть задачи, которые хорошо
+показывают уровень backend/automation-разработки:
 
-**Per-operation capability flags** делают orchestrator robust к разнородным API: каждый адаптер декларирует `CREATE_ORDER`, `LIST_SUBMISSIONS`, `ACCEPT_SUBMISSION` и т.д. Если функции нет — orchestrator корректно её не вызывает.
-
-**Два типа бирж** моделируются явно:
-- `PanelAdapter` (smmcode, prskill) — заказ предоплачен, нет accept/reject цикла.
-- `TaskExchangeAdapter` (unu, advego, ipgold) — per-submission accept/reject лайфцикл с реальными исполнителями.
+- **5 внешних интеграций** с разными протоколами: REST/JSON, form API, XML-RPC поверх
+  `httpx`, read-only live smoke для проверенных ключей.
+- **Денежный lifecycle**: заказ нельзя случайно разместить дважды, сабмишен нельзя
+  оплатить повторно.
+- **Асинхронная оркестрация**: Telegram bot + scheduler + CLI работают поверх одного
+  состояния в SQLite WAL.
+- **Независимая верификация**: бот не доверяет словам биржи, а сверяет результат через
+  Яндекс.Метрику, UTM и счётчики активности.
+- **Удобный Telegram UX**: сценарии на кнопках, динамический каталог услуг, ручной
+  fallback, админские подтверждения.
+- **Тестовая сетка**: контрактные тесты адаптеров, fault injection, Telegram FSM,
+  money-safety кейсы, live read-only проверки.
 
 ---
 
-## 💰 Money-safety: C1 + C2 инварианты
+## Сценарии
 
-Самая сложная часть — гарантировать что **на бирже не появится дубль заказа** и **сабмишен не будет оплачен дважды**. Документировано в `docs/DESIGN.md` + кодом enforce'нуто на 3 уровнях (БД-схема, helper'ы, оркестратор).
-
-### C1 — никаких дублей размещения
-
-| Шаг | Что происходит |
-|---|---|
-| 1 | `INSERT INTO orders (status='creating', ...)` **до** вызова API биржи |
-| 2 | Вызов `adapter.create_order(spec, client_order_uuid)` |
-| 3 | На успехе — `UPDATE ... SET status='active', external_order_id=?` (conditional, raises если rowcount ≠ 1) |
-| 4 | На ошибке — `UPDATE ... SET status='failed'` + audit `order_create_failed` |
-| 5 | При старте процесса — `reconcile_creating(min_age_seconds=300)` переводит orphan-CREATING строки старше 5 мин в FAILED |
-
-**Result:** даже при crash'е процесса посреди создания — orphan-строка не висит вечно. Защита от двойного размещения на бирже работает.
-
-### C2 — никаких двойных платежей
-
-Три уровня защиты:
-
-1. **БД-уровень:** `payments (exchange, external_submission_id) PRIMARY KEY` + partial unique index `uq_submissions_order_external` на `submissions(order_uuid, external_submission_id) WHERE external_submission_id IS NOT NULL`. Два конкурентных поллера физически не могут вставить дубль.
-
-2. **Атомарный claim:** `claim_submission_and_open_action()` за один commit делает condition UPDATE статуса (`NEW|VERIFYING|AWAITING_ADMIN → ACCEPTING`) **и** открывает `action_log` row. Никакого окна между «застолбили действие» и «записали что застолбили».
-
-3. **HTTP-вызов вне транзакции:** паттерн «занять → commit → внешний вызов → записать результат». DB-транзакции никогда не висят на время внешнего HTTP.
-
-### Heal-on-already-paid
-
-Если предыдущая попытка крашнулась **после** записи в `payments`, но **до** перевода `submissions` в терминальный статус — следующий вызов обнаружит payment-row и **залечит** статус (action_log → succeeded, submission → ACCEPTED), без повторного API-вызова.
-
-### Estimate-first cost cap
-
-Перед вызовом `/create_order` адаптер тянет каталог биржи (кэш), считает `cost = price × quantity` и **отказывает** если превышен `spec.max_cost`. UNU специально проверен — раньше `price=0` обходил cap, теперь fallback `min_price_rub → price → cost` с обязательным positive check.
-
----
-
-## 🧪 Тесты
-
-```
-187 passed, 9 skipped (live API; пропущены без credentials)
-```
-
-| Категория | Количество | Что покрывают |
+| Сценарий | Что делает бот | Как проверяет |
 |---|---|---|
-| Адаптеры (контрактные) | 100+ | mock HTTP responses, парсинг JSON/XML, статус-маппинг, error paths |
-| Audit-fixes | 9 | CRITICAL-1/2, HIGH-3/4/5 от Codex review (race-safe persistence, atomic claim, age-gated reconcile) |
-| Bot interactive UX | 23 | FSM, reply-keyboard handlers, callbacks, admin gating |
-| Bot full lifecycle | 4 | end-to-end через synthetic Update'ы |
-| Fault injection | 13 | network errors, malformed JSON/XML, mid-call crashes, token leakage, isolation |
-| Live API (read-only) | 9 | реальные вызовы к smmcode/unu/advego — balance, services, catalogue |
-| Live cost-cap (real API, $0) | 4 | подтверждение что estimate-first отказывает до `/create_order` против live-каталогов |
-| Service step (новый) | 13 | catalogue filter, ServiceOption, manual fallback, keyboard layout |
-| Day 1 audit | 16 | оригинальные регрессионные тесты |
-
-Запуск:
-```bash
-pytest                       # все 187 тестов
-pytest tests/test_e2e_real.py        # реальные API (требуется .env с ключами)
-pytest tests/test_live_roundtrip.py  # money-safety против live API ($0 trade)
-ruff check . && ruff format --check .
-```
+| Подписки в соцсетях | Создаёт заказ на подписку на целевой аккаунт | Сравнивает baseline и итоговый счётчик |
+| Лайки на новые посты | Находит новые посты и готовит заказ на лайки | Сравнивает рост активности по посту |
+| Переходы из соцсетей | Заказывает трафик из ВК, X, YouTube, Telegram, Дзен, Pinterest | Считает визиты в Яндекс.Метрике по UTM |
+| Ручной импорт | Подхватывает заказ, который уже создан на бирже | Ведёт его тем же lifecycle |
 
 ---
 
-## 🚀 Quick start
+## Архитектура
 
-### Установка
+```text
+ Telegram bot (aiogram 3)        CLI
+ /new_order /dashboard /review   smoke / monitor / verify / create-order
+          \                       /
+           \                     /
+            v                   v
+        +--------------------------------+
+        |         Orchestrator           |
+        | state machine + audit + C1/C2  |
+        +--------------------------------+
+          |             |              |
+          v             v              v
+   Exchange adapters  Verification   SQLite WAL
+   smmcode           TrafficVerifier orders
+   prskill           ActivityVerifier submissions
+   unu                               payments
+   advego                            action_log
+   ipgold                            report_rows
+          ^
+          |
+   APScheduler
+   poll_active_orders / poll_new_posts / weekly_report
+          |
+          v
+   Google Sheets export
+```
+
+Адаптеры разделены по типу площадки:
+
+| Тип | Площадки | Особенность |
+|---|---|---|
+| `PanelAdapter` | smmcode, prskill | Заказ предоплачен, нет per-submission accept/reject |
+| `TaskExchangeAdapter` | unu, advego, ipgold | Исполнители сдают отчёты, админ принимает или возвращает |
+
+Каждый адаптер декларирует capability-флаги: `CREATE_ORDER`, `LIST_SUBMISSIONS`,
+`ACCEPT_SUBMISSION`, `REJECT_SUBMISSION`, `GET_BALANCE`. Оркестратор смотрит на
+capabilities и не делает хрупких `isinstance`-ветвлений по конкретным биржам.
+
+---
+
+## Money-safety
+
+В проекте есть два инварианта, вокруг которых построен lifecycle.
+
+### C1: заказ не размещается дважды
+
+Перед внешним API-вызовом бот создаёт локальную строку `orders` в статусе
+`creating`. После успешного ответа биржи пишет `external_order_id` и переводит заказ
+в `active`. Если процесс упал посередине, startup reconcile поднимает старые
+`creating`-строки и переводит их в безопасный статус вместо повторного размещения.
+
+### C2: сабмишен не оплачивается дважды
+
+Оплата защищена на уровне БД и приложения:
+
+- `payments(exchange, external_submission_id)` имеет уникальный ключ;
+- claim сабмишена делается атомарным conditional update;
+- HTTP-вызов к бирже выполняется вне DB-транзакции;
+- результат фиксируется через `action_log`;
+- повторный callback в Telegram не создаёт вторую оплату.
+
+Это важнее красивого UI: бот работает с деньгами, поэтому отказоустойчивость здесь
+часть продукта, а не техническая деталь.
+
+---
+
+## Telegram UX
+
+Бот спроектирован для человека, который каждый день управляет заказами, а не для
+разработчика с терминалом.
+
+- Reply keyboard всегда под рукой: новый заказ, баланс, сводка, заказы, проверка,
+  очередь на ручное решение, отчёт, здоровье, отмена.
+- Inline FSM ведёт по шагам: сценарий -> биржа -> услуга -> URL -> количество ->
+  подтверждение.
+- Каталог услуг подтягивается с биржи и фильтруется под сценарий.
+- Перед созданием заказа показывается итоговая карточка с ценой и лимитами.
+- Денежные действия доступны только администратору.
+- CLI остаётся для smoke-проверок, отладки и автоматизации.
+
+---
+
+## Интеграции
+
+| Интеграция | Реализация |
+|---|---|
+| Telegram | `aiogram 3`, FSM, reply/inline keyboards, admin whitelist |
+| smmcode.shop | REST/JSON + Perfect Panel style form API |
+| prskill.ru | REST/JSON + каталог услуг |
+| unu.im | API v1, задачи, отчёты, балансы, тарифы |
+| advego.com | XML-RPC поверх async `httpx` |
+| ipgold.ru | capability-gated адаптер под неподтверждённые методы API |
+| Яндекс.Метрика | проверка трафика по UTM |
+| Google Sheets | еженедельная выгрузка во вкладку «Трафик из соц сетей» |
+
+---
+
+## Качество
+
+```bash
+pytest
+ruff check .
+ruff format --check .
+```
+
+Покрытие проверок:
+
+| Блок | Что проверяется |
+|---|---|
+| Адаптеры | Парсинг JSON/XML, статусы, ошибки API, каталоги услуг |
+| Orchestrator | Lifecycle заказов, C1/C2, audit log, reconcile |
+| Telegram bot | FSM, callbacks, admin gating, full lifecycle через synthetic updates |
+| Verification | TrafficVerifier, ActivityVerifier, mock/live режимы |
+| Fault injection | Network errors, malformed payloads, mid-call crashes, token sanitization |
+| Live smoke | Read-only вызовы к реальным API при наличии credentials |
+
+Текущая публичная сборка: **201 tests passing**, `ruff` clean.
+
+---
+
+## Быстрый старт
+
 ```bash
 git clone https://github.com/Refusned/Task-Monitoring-Bot.git
 cd Task-Monitoring-Bot
-python3.11 -m venv .venv && source .venv/bin/activate
+python3.11 -m venv .venv
+source .venv/bin/activate
 pip install -e ".[dev]"
-cp .env.example .env  # → заполнить credentials, оставить DRY_RUN=true для проверки
+cp .env.example .env
 ```
 
-### Локальный smoke (без денег)
+По умолчанию включён безопасный режим:
+
+```env
+DRY_RUN=true
+```
+
+Локальная проверка без денежных действий:
+
 ```bash
-python cli.py smoke                  # проверка config + БД + балансов бирж
-python cli.py monitor --dry-run      # read-only обзор активных заказов
-pytest                               # 187 тестов
+python cli.py smoke
+python cli.py monitor --dry-run
+pytest
 ```
 
-### Запуск бота
+Запуск Telegram-бота:
+
 ```bash
 python main.py
-# Telegram-сторона: открыть @monitoring_tasks_bot, нажать /start
 ```
-
-### Production deployment (systemd)
-См. `scripts/launchctl/` для macOS, или [systemd unit на сервере](#-деплой).
 
 ---
 
-## ⚙️ Конфигурация
+## Конфигурация
 
-Всё через `.env` (config-driven; неверная интерпретация ТЗ = правка `.env`, а не кода):
+Все изменяемые параметры вынесены в `.env`.
 
 | Переменная | Назначение |
 |---|---|
-| `DRY_RUN` | `true` = блокирует размещение реальных заказов (safety) |
-| `DAILY_SPEND_LIMIT`, `PER_ORDER_SPEND_LIMIT` | Жёсткие лимиты трат |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ADMIN_IDS` | Авторизация в Telegram |
-| `SMMCODE_API_KEY`, `UNU_API_KEY`, `ADVEGO_API_TOKEN`, `PRSKILL_API_KEY`, `IPGOLD_API_KEY` | Ключи бирж |
-| `METRICA_COUNTER_ID`, `METRICA_OAUTH_TOKEN` | Яндекс.Метрика (mock-режим если пусто) |
+| `DRY_RUN` | Блокирует write-действия на биржах |
+| `DAILY_SPEND_LIMIT`, `PER_ORDER_SPEND_LIMIT` | Суточный лимит и лимит на заказ |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ADMIN_IDS` | Telegram bot и список админов |
+| `SMMCODE_API_KEY`, `UNU_API_KEY`, `ADVEGO_API_TOKEN`, `PRSKILL_API_KEY`, `IPGOLD_API_KEY` | Доступы к биржам |
+| `METRICA_COUNTER_ID`, `METRICA_OAUTH_TOKEN` | Проверка трафика через Яндекс.Метрику |
 | `GOOGLE_SHEETS_CREDENTIALS_FILE`, `GOOGLE_SHEETS_SPREADSHEET_ID` | Еженедельный отчёт |
-| `TARGET_WEBSITE_URL`, `TARGET_SOCIAL_ACCOUNTS` | Цели для PostWatcher и отчётности |
+| `TARGET_WEBSITE_URL`, `TARGET_SOCIAL_ACCOUNTS` | Рабочие цели клиента |
+
+`.env` и runtime-файлы находятся в `.gitignore`. В репозитории есть только
+`.env.example` без секретов.
 
 ---
 
-## 📡 Деплой
+## Деплой
 
-Текущее боевое развёртывание на Ubuntu 24.04:
+Бот рассчитан на запуск как обычный Linux service: отдельный пользователь, venv,
+file lock против второго процесса, restart policy, закрытые права на `.env`.
+
+Пример unit-файла:
 
 ```ini
-# /etc/systemd/system/exchange-monitor-bot.service
 [Unit]
-Description=Exchange Order Monitor Bot - Telegram + scheduler
+Description=Exchange Order Monitor Bot
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=exchangebot                    # неprivileged user
+User=exchangebot
 Group=exchangebot
 WorkingDirectory=/opt/exchange-monitor-bot
 Environment=PYTHONUNBUFFERED=1
@@ -237,132 +269,56 @@ RestartSec=10
 TimeoutStopSec=30
 UMask=0077
 NoNewPrivileges=true
-StandardOutput=append:/opt/exchange-monitor-bot/logs/bot.log
-StandardError=append:/opt/exchange-monitor-bot/logs/bot.log
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-— автоматический рестарт при крэше, изолированный неpriv-пользователь, `NoNewPrivileges=true`, UMask 0077, единый file-lock против двойного запуска.
-
 ---
 
-## 📂 Структура
+## Структура
 
-```
+```text
 .
-├── adapters/             # 5 бирж + base ABC + ServiceOption DTO + capability flags
-│   ├── base.py           # ExchangeAdapter, PanelAdapter, TaskExchangeAdapter
-│   ├── smmcode.py        # REST/JSON, Perfect Panel form
-│   ├── prskill.py        # REST/JSON, Perfect Panel form
-│   ├── unu.py            # REST/JSON, native v1 protocol
-│   ├── advego.py         # XML-RPC поверх httpx (async-native)
-│   └── ipgold.py         # capability-gated stub (API не подтверждён)
-├── bot/                  # aiogram 3
-│   ├── handlers.py       # FSM + slash commands + reply keyboard
-│   └── keyboards.py      # Inline + reply keyboards
-├── db/
-│   ├── database.py       # aiosqlite, WAL, claim helpers, audit log
-│   └── schema.sql        # 7 таблиц + partial unique index + CHECK constraints
-├── orchestrator.py       # state machine, C1/C2 enforcement, scheduling
-├── verification/         # TrafficVerifier (Метрика+UTM), ActivityVerifier
-├── reporting/sheets.py   # gspread, weekly report
-├── posts/watcher.py      # A3: детектор новых постов в Telegram-каналах
-├── scheduler.py          # APScheduler integration
-├── cli.py                # smoke / monitor / verify / create-order
-├── main.py               # Telegram polling + APScheduler entry point
-├── config.py             # pydantic-settings, всё из .env
-├── models.py             # OrderStatus, SubmissionStatus, OrderSpec, ...
-├── tests/                # 187 тестов
+├── adapters/          # 5 бирж, base ABC, capability flags
+├── bot/               # aiogram handlers и keyboards
+├── db/                # schema, WAL setup, claim helpers, audit log
+├── verification/      # TrafficVerifier и ActivityVerifier
+├── reporting/         # Google Sheets writer
+├── posts/             # watcher новых постов
+├── tests/             # unit, integration, fault-injection, live smoke
 ├── docs/
-│   ├── DESIGN.md         # архитектура, решения, инварианты
-│   └── api/              # доки по каждой бирже (smmcode, unu, advego, prskill, ipgold)
-└── scripts/launchctl/    # macOS launchd plist для локальной автозагрузки
+│   ├── DESIGN.md      # архитектурный разбор
+│   └── api/           # заметки по API бирж
+├── cli.py             # smoke / monitor / verify / create-order
+├── main.py            # Telegram polling + scheduler
+├── orchestrator.py    # state machine и money-safety
+├── config.py          # pydantic-settings
+└── models.py          # доменные модели и статусы
 ```
 
 ---
 
-## 📐 Дизайн-решения
+## Документация
 
-Подробности — в [`docs/DESIGN.md`](./docs/DESIGN.md). Кратко:
-
-| # | Решение | Обоснование |
-|---|---|---|
-| **A1** | Бот не только мониторит, но и **создаёт** заказы | ТЗ прямо требует «Создание заказов» в обоих сценариях MVP |
-| **A2** | Targets (URL/аккаунты) — config-driven, не hardcode | Расширяемость; смена клиентов без правки кода |
-| **A3** | `PostWatcher` отслеживает новые посты автоматически | «Лайки на новые посты» в ТЗ → бот должен сам видеть новые |
-| **A4** | Независимая верификация результата | Смысл бота — перепроверить перед оплатой; доверие бирже его обнуляет |
-| **A5** | Оплата подтверждается админом по умолчанию | Senior-default для денежных действий; auto-accept — опт-ин по порогу |
-| **A6** | Возврат на доработку — автоматический | Возврат не тратит деньги и обратим |
-| **A7** | Импорт существующих заказов по `external_order_id` | ТЗ «уже РАЗМЕЩЁННЫЕ» прямым текстом |
-| **A8** | 6 source-платформ из ТЗ → enum `SourcePlatform` | ВК/X/YouTube/Telegram/Дзен/Pinterest |
-| **A9** | Структура отчёта Google Sheets: Неделя · Платформа · Биржа · Заказано · Факт · Стоимость · Статус | Логично выводится из ТЗ; адаптируется к существующей таблице по заголовкам |
-| **A10** | Яндекс.Метрика — опционально (mock-режим без credentials) | Не блокировать разработку и демо отсутствием доступов |
-| **A11** | Создание заказов и в Telegram, и в CLI | «Бот» в ТЗ → создание в Telegram; CLI нужен для тестируемости |
-| **A12** | Деливерабл = рабочий MVP + `DESIGN.md` | Сильнейшая подача для теста на инженерную позицию |
+- [docs/DESIGN.md](./docs/DESIGN.md) — архитектура, lifecycle, инварианты, trade-offs.
+- [docs/api](./docs/api/) — заметки по API каждой площадки.
+- [docs/demo.html](./docs/demo.html) — локальная презентация продукта.
+- [CLAUDE.md](./CLAUDE.md) — технический контекст для AI-assisted разработки.
 
 ---
 
-## 🔒 Безопасность
+## Безопасность и комплаенс
 
-- **Секреты только в `.env`** (gitignored). `.env.example` — шаблон с пустыми значениями.
-- **DRY_RUN=true по умолчанию** блокирует создание заказов на боевых биржах. Снимается осознанно одним переключателем.
-- **Подтверждение админом** перед каждой денежной операцией (configurable порог для auto-accept).
-- **Лимиты трат**: per-order + daily, проверяются в той же транзакции что и вставка заказа.
-- **Audit log** для каждого денежного действия + reconcile при старте.
-- **Без обхода анти-бот систем** — работа только через документированные API.
-- **API-токены не утекают в логи и сообщения**: error-payload sanitization (`safe_payload` без `api_token`).
-
----
-
-## 🛠 Стек
-
-| Слой | Технология |
-|---|---|
-| Язык | Python 3.11+ (async/await) |
-| Telegram | `aiogram 3` |
-| HTTP | `httpx` (включая XML-RPC поверх httpx для advego) |
-| Scheduler | `APScheduler` (max_instances=1, coalesce=True) |
-| БД | `aiosqlite` в режиме WAL — single source of truth |
-| Config | `pydantic` + `pydantic-settings` |
-| Google Sheets | `gspread` |
-| Тесты | `pytest` + `pytest-asyncio` + `httpx.MockTransport` |
-| Линт | `ruff check` + `ruff format` |
-| Deploy | `systemd` + venv + dedicated unprivileged user |
+- Только авторизованные аккаунты и предоставленные клиентом доступы.
+- Без обхода антибот-систем и без сбора чужих учётных данных.
+- Денежные действия подтверждаются администратором, auto-accept включается только
+  через конфиг.
+- Все write-действия блокируются `DRY_RUN=true` в публичной конфигурации.
+- Токены маскируются в логах и Telegram-сообщениях.
 
 ---
 
-## 📊 Качество кода
-
-- ✅ `ruff check` — 0 errors
-- ✅ `ruff format --check` — clean
-- ✅ 187 / 187 unit + integration tests passing
-- ✅ 9 / 9 live API smoke (real exchanges, $0)
-- ✅ 4 / 4 live cost-cap (real exchanges, $0)
-- ✅ Type hints везде (`from __future__ import annotations`)
-- ✅ Docstrings на классах + publicc helpers
-- ✅ Per-операционные capability-флаги вместо `isinstance` deep в логике
-
----
-
-## 📚 Дополнительная документация
-
-- [`docs/DESIGN.md`](./docs/DESIGN.md) — полный архитектурный документ, обоснования допущений A1–A12, money-safety инварианты
-- [`docs/api/*.md`](./docs/api/) — доки по каждой бирже: endpoints, статус-маппинг, нюансы
-- [`CLAUDE.md`](./CLAUDE.md) — заметки разработчика (внутренний контекст)
-
----
-
-## 📝 Лицензия
+## Лицензия
 
 MIT — см. [LICENSE](LICENSE).
-
----
-
-<div align="center">
-
-Разработано как тестовое задание для позиции ИИ-инженера.<br>
-Production-ready бот, который **реально работает** на боевом сервере 24/7.
-
-</div>
