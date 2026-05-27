@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     auto_accept_threshold_cost: float = Field(default=0.0, ge=0)  # 0 = always require human
     daily_spend_limit: float = Field(default=1000.0, ge=0)
     per_order_spend_limit: float = Field(default=200.0, ge=0)
+    auto_reject_uncertain_results: bool = True
     db_path: Path = Path("./exchange_monitor.db")
     order_poll_interval_seconds: int = Field(default=300, ge=10)
     posts_poll_interval_seconds: int = Field(default=900, ge=30)

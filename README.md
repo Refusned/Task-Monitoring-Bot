@@ -8,7 +8,7 @@
 
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![aiogram](https://img.shields.io/badge/aiogram-3.x-2CA5E0?logo=telegram&logoColor=white)](https://docs.aiogram.dev/)
-[![Tests](https://img.shields.io/badge/tests-205%20passing-brightgreen)](#-качество)
+[![Tests](https://img.shields.io/badge/tests-206%20passing-brightgreen)](#-качество)
 [![Lint](https://img.shields.io/badge/ruff-clean-success)](#-качество)
 [![Deploy](https://img.shields.io/badge/deploy-systemd-blue)](#-деплой)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
@@ -202,7 +202,7 @@ ruff format --check .
 | Fault injection | Network errors, malformed payloads, mid-call crashes, token sanitization |
 | Live smoke | Read-only вызовы к реальным API при наличии credentials |
 
-Текущая публичная сборка: **205 tests passing**, `ruff` clean.
+Текущая публичная сборка: **206 tests passing**, `ruff` clean.
 
 ---
 
@@ -248,6 +248,7 @@ python main.py
 |---|---|
 | `DRY_RUN` | Блокирует write-действия на биржах |
 | `DAILY_SPEND_LIMIT`, `PER_ORDER_SPEND_LIMIT` | Суточный лимит и лимит на заказ |
+| `AUTO_REJECT_UNCERTAIN_RESULTS` | В live-режиме возвращает сомнительные результаты без ручного решения |
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ADMIN_IDS` | Telegram bot и список админов |
 | `SMMCODE_API_KEY`, `UNU_API_KEY`, `ADVEGO_API_TOKEN`, `PRSKILL_API_KEY`, `IPGOLD_API_KEY` | Доступы к биржам |
 | `METRICA_COUNTER_ID`, `METRICA_OAUTH_TOKEN` | Проверка трафика через Яндекс.Метрику |

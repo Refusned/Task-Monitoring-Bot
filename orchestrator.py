@@ -352,6 +352,25 @@ class Orchestrator:
             }
 
         # needs_human_review
+        if self._settings.auto_reject_uncertain_results:
+            await self._update_order_status(order.client_order_uuid, OrderStatus.FAILED)
+            await self._record_report_row(order, actual_count=int(result.measured), status="failed")
+            await self._audit(
+                "panel_uncertain_auto_failed",
+                order.client_order_uuid,
+                {
+                    "verdict": result.verdict.value,
+                    "reason": result.reason,
+                    "policy": "auto_reject_uncertain_results",
+                },
+            )
+            return {
+                "order_uuid": order.client_order_uuid,
+                "status": "failed",
+                "verdict": result.verdict.value,
+                "reason": "uncertain verification auto-failed by policy",
+            }
+
         await self._audit(
             "panel_needs_review",
             order.client_order_uuid,
@@ -487,6 +506,20 @@ class Orchestrator:
             return await self._accept_submission(order, adapter, sub, result)
 
         if result.verdict == VerificationVerdict.FAIL:
+            return await self._reject_submission(order, adapter, sub, result)
+
+        if self._settings.auto_reject_uncertain_results and not self._settings.dry_run:
+            result = VerificationResult(
+                verdict=VerificationVerdict.FAIL,
+                measured=result.measured,
+                expected=result.expected,
+                reason=f"uncertain verification auto-rejected by policy: {result.reason}",
+                raw_evidence={
+                    **result.raw_evidence,
+                    "original_verdict": VerificationVerdict.NEEDS_HUMAN_REVIEW.value,
+                    "policy": "auto_reject_uncertain_results",
+                },
+            )
             return await self._reject_submission(order, adapter, sub, result)
 
         # needs_human_review: VERIFYING → AWAITING_ADMIN (conditional, CRITICAL-2).

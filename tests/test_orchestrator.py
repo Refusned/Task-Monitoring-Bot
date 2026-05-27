@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from adapters.base import Capability, PanelAdapter
 from config import Settings
 from db.database import (
     connect,
@@ -23,7 +24,16 @@ from db.database import (
     mark_order_active,
     payment_exists,
 )
-from models import Order, OrderSpec, OrderStatus, Scenario, SourcePlatform, Submission
+from models import (
+    Order,
+    OrderSpec,
+    OrderStatus,
+    Scenario,
+    SourcePlatform,
+    Submission,
+    VerificationResult,
+    VerificationVerdict,
+)
 from orchestrator import Orchestrator
 
 
@@ -60,6 +70,33 @@ def _make_adapters(dry_run: bool = True) -> dict:
     return {}
 
 
+class _CompletedPanelAdapter(PanelAdapter):
+    name = "smmcode"
+
+    def capabilities(self) -> set[Capability]:
+        return {Capability.GET_ORDER_STATUS, Capability.CREATE_ORDER}
+
+    async def get_balance(self) -> float:
+        return 100.0
+
+    async def create_order(self, spec: OrderSpec, client_order_uuid: str) -> tuple[str, float]:
+        return "ext-panel", 1.0
+
+    async def get_order_status(self, external_order_id: str) -> str:
+        return "completed"
+
+
+class _NeedsReviewVerifier:
+    async def verify(self, order: Order, **kwargs) -> VerificationResult:
+        return VerificationResult(
+            verdict=VerificationVerdict.NEEDS_HUMAN_REVIEW,
+            measured=float(order.spec.quantity) * 0.5,
+            expected=float(order.spec.quantity),
+            reason="borderline result",
+            raw_evidence={"mode": "test"},
+        )
+
+
 @pytest.fixture
 async def db():
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
@@ -78,6 +115,39 @@ async def test_poll_empty(db: Settings) -> None:
     async with connect(db) as conn:
         active = await list_active_orders(conn)
     assert active == []
+
+
+@pytest.mark.asyncio
+async def test_uncertain_panel_result_auto_fails_when_policy_enabled(db: Settings) -> None:
+    settings = db.model_copy(update={"dry_run": False, "auto_reject_uncertain_results": True})
+    spec = _make_order_spec(Scenario.ACTIVITY_LIKE).model_copy(
+        update={"exchange": "smmcode", "service_id": "likes"}
+    )
+    order = Order(
+        client_order_uuid="uncertain-panel",
+        spec=spec,
+        status=OrderStatus.CREATING,
+        external_order_id=None,
+        cost_actual=None,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    async with connect(settings) as conn:
+        await insert_order_creating(conn, order)
+        await mark_order_active(conn, "uncertain-panel", "ext-panel", 1.0)
+
+    orch = Orchestrator(
+        settings,
+        adapters={"smmcode": _CompletedPanelAdapter()},
+        activity_verifier=_NeedsReviewVerifier(),
+    )
+    results = await orch.poll_all()
+
+    assert results[0]["status"] == "failed"
+    async with connect(settings) as conn:
+        stored = await get_order(conn, "uncertain-panel")
+    assert stored is not None
+    assert stored.status == OrderStatus.FAILED
 
 
 @pytest.mark.asyncio
