@@ -15,6 +15,7 @@ from autopilot.runner import AutopilotRunner
 from config import Settings
 from db.database import connect, get_order, init_db, list_active_orders
 from models import OrderSpec, Scenario
+from verification.activity_metrics import ActivityMetricSnapshot, ActivityMetricsProvider
 
 
 class _FakePlanner:
@@ -50,6 +51,16 @@ class _FakePanelAdapter(PanelAdapter):
 
     async def get_order_status(self, external_order_id: str) -> str:
         return "completed"
+
+
+class _FakeMetricsProvider(ActivityMetricsProvider):
+    def __init__(self, snapshot: ActivityMetricSnapshot | None) -> None:
+        self.snapshot = snapshot
+
+    async def measure(self, target: str, scenario: Scenario) -> ActivityMetricSnapshot | None:
+        assert target
+        assert scenario
+        return self.snapshot
 
 
 def _settings(tmp_path: Path, *, dry_run: bool) -> Settings:
@@ -109,7 +120,7 @@ async def test_autopilot_selects_cheapest_service_and_creates_order(tmp_path: Pa
     await init_db(settings)
     intent = AutopilotIntent(
         scenario=Scenario.ACTIVITY_LIKE,
-        target="https://youtube.com/watch?v=abc",
+        target="https://youtube.com/watch?v=dQw4w9WgXcQ",
         quantity=100,
         confidence=0.9,
     )
@@ -126,6 +137,13 @@ async def test_autopilot_selects_cheapest_service_and_creates_order(tmp_path: Pa
         settings,
         {"expensive": expensive, "cheap": cheap},
         _FakePlanner(intent),
+        activity_metrics_provider=_FakeMetricsProvider(
+            ActivityMetricSnapshot(
+                metric="likeCount",
+                count=1000,
+                source="test",
+            )
+        ),
     )
     result = await runner.run_goal("100 likes", actor="test:autopilot")
 
@@ -133,14 +151,51 @@ async def test_autopilot_selects_cheapest_service_and_creates_order(tmp_path: Pa
     assert result.selected is not None
     assert result.selected.exchange == "cheap"
     assert result.cost == pytest.approx(3.0)
+    assert result.baseline_count == 1000
+    assert result.baseline_metric == "likeCount"
+    assert result.baseline_source == "test"
     assert len(cheap.created_specs) == 1
     assert expensive.created_specs == []
+    assert cheap.created_specs[0].baseline_count == 1000
 
     async with connect(settings) as conn:
         stored = await get_order(conn, result.order_uuid)
     assert stored is not None
     assert stored.spec.exchange == "cheap"
     assert stored.spec.service_id == "cheap-like"
+    assert stored.spec.baseline_count == 1000
+    assert stored.spec.baseline_metric == "likeCount"
+    assert stored.spec.baseline_source == "test"
+
+
+@pytest.mark.asyncio
+async def test_autopilot_refuses_live_activity_order_without_baseline(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, dry_run=False)
+    await init_db(settings)
+    intent = AutopilotIntent(
+        scenario=Scenario.ACTIVITY_VIEW,
+        target="https://youtube.com/watch?v=dQw4w9WgXcQ",
+        quantity=1000,
+        confidence=0.9,
+    )
+    adapter = _FakePanelAdapter(
+        "views",
+        [ServiceOption(service_id="views-1", name="Просмотры YouTube", price_per_unit=0.01)],
+    )
+    runner = AutopilotRunner(
+        settings,
+        {"views": adapter},
+        _FakePlanner(intent),
+        activity_metrics_provider=_FakeMetricsProvider(None),
+    )
+
+    result = await runner.run_goal("1000 просмотров", actor="test:autopilot")
+
+    assert result.status == "create_failed"
+    assert "baseline is unavailable" in result.reason
+    assert adapter.created_specs == []
+    async with connect(settings) as conn:
+        assert await list_active_orders(conn) == []
 
 
 @pytest.mark.asyncio

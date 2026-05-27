@@ -53,6 +53,7 @@ from models import (
 )
 from orchestrator import Orchestrator
 from reporting.sheets import preview_weekly_rows
+from verification.activity_metrics import build_activity_metrics_provider
 
 # ---------------------------------------------------------------------------
 # Router + admin guard
@@ -127,7 +128,7 @@ async def on_startup(bot: Bot, settings: Settings) -> None:
 
 WELCOME_TEXT = (
     "👋 *Бот мониторинга бирж*\n\n"
-    "Создаю и веду заказы на 5 биржах накрутки и микрозадач, проверяю\n"
+    "Создаю и веду заказы на 5 SMM-панелях и биржах микрозадач, проверяю\n"
     "результат и могу автоматически выбрать биржу по цели через LLM.\n\n"
     "Главное меню — внизу под полем ввода. Нажимайте кнопки —\n"
     "или отправьте цель одной фразой через /goal."
@@ -373,7 +374,16 @@ async def _run_autopilot_goal(
             http_client=http_client,
             timeout_seconds=settings.ollama_timeout_seconds,
         )
-        runner = AutopilotRunner(settings, adapters, planner)
+        metrics_provider = build_activity_metrics_provider(
+            youtube_api_key=settings.youtube_data_api_key,
+            http_client=http_client,
+        )
+        runner = AutopilotRunner(
+            settings,
+            adapters,
+            planner,
+            activity_metrics_provider=metrics_provider,
+        )
         result = await runner.run_goal(goal_text, actor=actor)
     await message.answer(format_autopilot_result(result), reply_markup=keyboards.main_menu())
 

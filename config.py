@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     # Yandex Metrica. Empty values => TrafficVerifier in mock mode.
     metrica_counter_id: str = ""
     metrica_oauth_token: str = ""
+    youtube_data_api_key: str = ""
 
     # Google Sheets
     google_sheets_credentials_file: str = ""

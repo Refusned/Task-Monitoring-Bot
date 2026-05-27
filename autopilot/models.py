@@ -49,4 +49,7 @@ class AutopilotResult(BaseModel):
     order_uuid: str | None = None
     external_order_id: str | None = None
     cost: float | None = None
+    baseline_count: int | None = None
+    baseline_metric: str | None = None
+    baseline_source: str | None = None
     reason: str = ""

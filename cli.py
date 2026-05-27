@@ -318,6 +318,7 @@ async def autopilot_command(settings: Settings, args: argparse.Namespace) -> int
     """LLM-driven goal -> cheapest viable service -> optional live order."""
     from autopilot.ollama import OllamaPlanner
     from autopilot.runner import AutopilotRunner, format_autopilot_result
+    from verification.activity_metrics import build_activity_metrics_provider
 
     goal_text = args.goal or " ".join(args.goal_words or [])
     goal_text = goal_text.strip()
@@ -341,7 +342,16 @@ async def autopilot_command(settings: Settings, args: argparse.Namespace) -> int
             http_client=http_client,
             timeout_seconds=effective_settings.ollama_timeout_seconds,
         )
-        runner = AutopilotRunner(effective_settings, adapters, planner)
+        metrics_provider = build_activity_metrics_provider(
+            youtube_api_key=effective_settings.youtube_data_api_key,
+            http_client=http_client,
+        )
+        runner = AutopilotRunner(
+            effective_settings,
+            adapters,
+            planner,
+            activity_metrics_provider=metrics_provider,
+        )
         result = await runner.run_goal(
             goal_text,
             actor="cli:autopilot",

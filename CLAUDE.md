@@ -114,6 +114,9 @@ models.py       доменные модели и статусы
   adapters return `ServiceOption`, `AutopilotRunner` picks the cheapest candidate
   that fits quantity and max_cost.
 - In `DRY_RUN=true`, autopilot returns a plan and does not call exchange create APIs.
+- In live mode, activity goals that need public counters capture baseline before
+  order creation. YouTube subscribers/likes/views require `YOUTUBE_DATA_API_KEY`;
+  without a measurable baseline the runner refuses the paid order.
 
 Источник трафика задаётся через `SourcePlatform`: VK, X, YouTube, Telegram, Dzen,
 Pinterest.
@@ -121,7 +124,8 @@ Pinterest.
 ## Проверка результата
 
 - `TrafficVerifier`: Яндекс.Метрика + UTM, mock/live режим.
-- `ActivityVerifier`: baseline + финальный счётчик активности.
+- `ActivityVerifier`: baseline + финальный счётчик активности; YouTube
+  subscribers/likes/views read public counters through YouTube Data API.
 - Вердикты: `auto_pass`, `needs_human_review`, `fail`.
 
 ## Конфигурация
@@ -133,6 +137,7 @@ Pinterest.
 - Telegram token и admin ids;
 - API-ключи бирж;
 - Яндекс.Метрика;
+- `YOUTUBE_DATA_API_KEY`;
 - Google Sheets;
 - целевой сайт и соцсети.
 

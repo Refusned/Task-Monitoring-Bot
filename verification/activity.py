@@ -1,16 +1,14 @@
-"""Activity verifier: checks subscribe / like / view completion.
-
-A4: independent check, not trusting exchange status.
-For MVP we use deterministic mock evidence (public counters are hard to query
-without auth for every platform). Real implementation = platform-specific scrapers
-or API calls (Day 6+).
-"""
+"""Activity verifier: checks subscribe / like / view completion."""
 
 from __future__ import annotations
 
 import random
 
 from models import Order, Scenario, Submission, VerificationResult, VerificationVerdict
+from verification.activity_metrics import (
+    ActivityMetricsProvider,
+    build_activity_metrics_provider,
+)
 from verification.base import Verifier, _make_result
 
 
@@ -25,9 +23,14 @@ class ActivityVerifier(Verifier):
         *,
         mock: bool = True,
         mock_hit_ratio: float = 0.9,
+        metrics_provider: ActivityMetricsProvider | None = None,
+        youtube_api_key: str = "",
     ) -> None:
         self._mock = mock
         self._mock_hit_ratio = max(0.0, min(1.0, mock_hit_ratio))
+        self._metrics_provider = metrics_provider or build_activity_metrics_provider(
+            youtube_api_key=youtube_api_key
+        )
 
     async def verify(self, order: Order, **kwargs) -> VerificationResult:
         if order.spec.scenario not in (
@@ -60,13 +63,74 @@ class ActivityVerifier(Verifier):
                 },
             )
 
-        # TODO: real platform APIs / scraping (Day 6+)
-        return VerificationResult(
-            verdict=VerificationVerdict.NEEDS_HUMAN_REVIEW,
-            measured=0.0,
+        if order.spec.baseline_count is None:
+            return VerificationResult(
+                verdict=VerificationVerdict.NEEDS_HUMAN_REVIEW,
+                measured=0.0,
+                expected=expected,
+                reason="activity baseline is missing; cannot prove delivered delta",
+                raw_evidence={
+                    "verifier": "activity",
+                    "mode": "real",
+                    "status": "missing_baseline",
+                    "scenario": order.spec.scenario.value,
+                    "target": order.spec.target,
+                },
+            )
+
+        try:
+            snapshot = await self._metrics_provider.measure(order.spec.target, order.spec.scenario)
+        except Exception as exc:
+            return VerificationResult(
+                verdict=VerificationVerdict.NEEDS_HUMAN_REVIEW,
+                measured=0.0,
+                expected=expected,
+                reason=f"activity check failed: {type(exc).__name__}: {exc}",
+                raw_evidence={
+                    "verifier": "activity",
+                    "mode": "real",
+                    "status": "error",
+                    "error_type": type(exc).__name__,
+                    "scenario": order.spec.scenario.value,
+                    "target": order.spec.target,
+                },
+            )
+
+        if snapshot is None:
+            return VerificationResult(
+                verdict=VerificationVerdict.NEEDS_HUMAN_REVIEW,
+                measured=0.0,
+                expected=expected,
+                reason="no activity metrics provider supports this target",
+                raw_evidence={
+                    "verifier": "activity",
+                    "mode": "real",
+                    "status": "unsupported_target",
+                    "scenario": order.spec.scenario.value,
+                    "target": order.spec.target,
+                },
+            )
+
+        measured_delta = max(0, snapshot.count - order.spec.baseline_count)
+        return _make_result(
+            measured=float(measured_delta),
             expected=expected,
-            reason="real activity check not wired yet",
-            raw_evidence={"verifier": "activity", "mode": "real", "status": "not_implemented"},
+            reason=(
+                f"{snapshot.source}: {snapshot.metric} delta {measured_delta} "
+                f"(baseline {order.spec.baseline_count} -> current {snapshot.count})"
+            ),
+            raw_evidence={
+                "verifier": "activity",
+                "mode": "real",
+                "status": "ok",
+                "scenario": order.spec.scenario.value,
+                "target": order.spec.target,
+                "baseline_count": order.spec.baseline_count,
+                "current_count": snapshot.count,
+                "metric": snapshot.metric,
+                "source": snapshot.source,
+                **snapshot.raw_evidence,
+            },
         )
 
     def _mock_delta(self, order: Order, submission: Submission | None = None) -> float:

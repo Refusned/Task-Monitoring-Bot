@@ -10,7 +10,8 @@ from autopilot.models import AutopilotCandidate, AutopilotIntent, AutopilotResul
 from autopilot.ollama import OllamaPlannerError
 from cli import _persist_and_create
 from config import Settings
-from models import OrderSpec
+from models import OrderSpec, Scenario
+from verification.activity_metrics import ActivityMetricSnapshot, ActivityMetricsProvider
 
 
 class GoalPlanner(Protocol):
@@ -25,10 +26,12 @@ class AutopilotRunner:
         settings: Settings,
         adapters: Mapping[str, ExchangeAdapter],
         planner: GoalPlanner,
+        activity_metrics_provider: ActivityMetricsProvider | None = None,
     ) -> None:
         self._settings = settings
         self._adapters = adapters
         self._planner = planner
+        self._activity_metrics_provider = activity_metrics_provider
 
     async def run_goal(
         self,
@@ -81,6 +84,34 @@ class AutopilotRunner:
             source_platform=intent.source_platform,
             max_cost=budget,
         )
+        try:
+            baseline = await self._capture_baseline(intent)
+        except Exception as exc:
+            return AutopilotResult(
+                status="create_failed",
+                intent=intent,
+                selected=selected,
+                candidates=candidates,
+                reason=f"activity baseline check failed: {type(exc).__name__}: {exc}",
+            )
+        if self._needs_activity_baseline(intent) and baseline is None:
+            return AutopilotResult(
+                status="create_failed",
+                intent=intent,
+                selected=selected,
+                candidates=candidates,
+                reason=(
+                    "activity baseline is unavailable; refusing live order without verifiable delta"
+                ),
+            )
+        if baseline is not None:
+            spec = spec.model_copy(
+                update={
+                    "baseline_count": baseline.count,
+                    "baseline_metric": baseline.metric,
+                    "baseline_source": baseline.source,
+                }
+            )
         adapter = self._adapters[selected.exchange]
         try:
             order_uuid, external_id, cost = await _persist_and_create(
@@ -106,6 +137,9 @@ class AutopilotRunner:
             order_uuid=order_uuid,
             external_order_id=external_id,
             cost=cost,
+            baseline_count=baseline.count if baseline is not None else None,
+            baseline_metric=baseline.metric if baseline is not None else None,
+            baseline_source=baseline.source if baseline is not None else None,
         )
 
     async def _collect_candidates(
@@ -152,6 +186,18 @@ class AutopilotRunner:
         candidates.sort(key=_candidate_sort_key)
         return candidates
 
+    async def _capture_baseline(self, intent: AutopilotIntent) -> ActivityMetricSnapshot | None:
+        if not self._needs_activity_baseline(intent) or self._activity_metrics_provider is None:
+            return None
+        return await self._activity_metrics_provider.measure(intent.target, intent.scenario)
+
+    def _needs_activity_baseline(self, intent: AutopilotIntent) -> bool:
+        return intent.scenario in {
+            Scenario.ACTIVITY_SUBSCRIBE,
+            Scenario.ACTIVITY_LIKE,
+            Scenario.ACTIVITY_VIEW,
+        }
+
 
 def _candidate_sort_key(candidate: AutopilotCandidate) -> tuple[float, float, str, str]:
     return (
@@ -193,6 +239,10 @@ def format_autopilot_result(result: AutopilotResult) -> str:
         lines.append(f"external_order_id: {result.external_order_id}")
     if result.cost is not None:
         lines.append(f"actual_cost: {result.cost:.2f}")
+    if result.baseline_count is not None:
+        metric = result.baseline_metric or "counter"
+        source = result.baseline_source or "activity_provider"
+        lines.append(f"baseline: {source}:{metric}={result.baseline_count}")
     if result.reason:
         lines.append(f"reason: {result.reason}")
     if result.candidates:

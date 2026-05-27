@@ -64,7 +64,10 @@ class Orchestrator:
     ) -> None:
         self._settings = settings
         self._adapters = adapters
-        self._activity_verifier = activity_verifier or ActivityVerifier(mock=settings.dry_run)
+        self._activity_verifier = activity_verifier or ActivityVerifier(
+            mock=settings.dry_run,
+            youtube_api_key=settings.youtube_data_api_key,
+        )
         self._traffic_verifier = traffic_verifier or TrafficVerifier(
             counter_id=settings.metrica_counter_id,
             oauth_token=settings.metrica_oauth_token,

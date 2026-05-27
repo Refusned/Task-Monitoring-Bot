@@ -96,7 +96,9 @@ per-submission accept/rework, у бирж микрозадач есть.
 ## Проверка
 
 - Трафик: `TrafficVerifier`, Яндекс.Метрика + UTM.
-- Активность: `ActivityVerifier`, baseline + финальный счётчик.
+- Активность: `ActivityVerifier`, baseline + финальный счётчик. Для live-заказов
+  на YouTube subscribers/likes/views baseline снимается через `YOUTUBE_DATA_API_KEY`;
+  без него автопилот не должен создавать платный заказ.
 - Вердикты: `auto_pass`, `needs_human_review`, `fail`.
 
 ## Команды

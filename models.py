@@ -84,6 +84,9 @@ class OrderSpec(BaseModel):
     service_id: str | None = None  # exchange-specific catalog id, where present
     source_platform: SourcePlatform | None = None  # required for SOCIAL_TRAFFIC
     max_cost: float = Field(gt=0)
+    baseline_count: int | None = Field(default=None, ge=0)
+    baseline_metric: str | None = None
+    baseline_source: str | None = None
 
     @model_validator(mode="after")
     def _check_source_platform_required_for_traffic(self) -> OrderSpec:
