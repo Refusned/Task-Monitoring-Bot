@@ -46,21 +46,14 @@ CREATE TABLE IF NOT EXISTS submissions (
     evidence TEXT,
     raw_exchange_status TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    -- Day 3 audit (CRITICAL-1 fix): one local row per external submission per order.
+    -- SQLite allows multiple NULLs in UNIQUE, so this only constrains non-null externals.
+    UNIQUE(order_uuid, external_submission_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_submissions_order ON submissions(order_uuid);
 CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions(status);
-
--- Day 3 audit (CRITICAL-1 fix): one local row per external submission per order.
--- Partial unique index (skips NULL external_submission_id) so two concurrent
--- pollers converge on a single canonical row via INSERT OR IGNORE in
--- ensure_submission_persisted(). Applies to fresh installs AND to the existing
--- live DB (CREATE INDEX IF NOT EXISTS is idempotent, unlike inline UNIQUE on a
--- pre-existing table).
-CREATE UNIQUE INDEX IF NOT EXISTS uq_submissions_order_external
-    ON submissions(order_uuid, external_submission_id)
-    WHERE external_submission_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS payments (
     -- C2: terminal money decision per submission is UNIQUE.
@@ -118,11 +111,66 @@ CREATE TABLE IF NOT EXISTS report_rows (
     actual_count INTEGER CHECK(actual_count IS NULL OR actual_count >= 0),
     cost REAL CHECK(cost IS NULL OR cost >= 0),
     status TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    order_uuid TEXT  -- added via ALTER TABLE on existing DBs (see init_db)
 );
 
-CREATE TABLE IF NOT EXISTS watcher_state (
-    account_url TEXT PRIMARY KEY,
-    last_post_id TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+-- NOTE: The unique index on order_uuid is created in db.database.init_db AFTER
+-- the ALTER TABLE migration so the column exists when the index is built. We
+-- can't put it here because executescript would run it before the migration.
+
+-- ===== Agent-layer tables (v4 pivot) =====
+
+-- Last-known balance per exchange (best-effort cache).
+-- Source of truth = the exchange itself via adapter.get_balance().
+-- TTL is enforced in code (default 60s); we keep stale rows as fallback.
+CREATE TABLE IF NOT EXISTS exchange_balance_cache (
+    exchange TEXT PRIMARY KEY,
+    amount REAL NOT NULL CHECK(amount >= 0),
+    currency TEXT NOT NULL DEFAULT 'USD',
+    fetched_at TEXT NOT NULL
 );
+
+-- Pending topup hints emitted by the agent when no exchange has enough funds.
+-- Resolved by APScheduler when the exchange's balance crosses requested_amount.
+CREATE TABLE IF NOT EXISTS topup_requests (
+    topup_uuid TEXT PRIMARY KEY,
+    exchange TEXT NOT NULL,
+    requested_amount REAL NOT NULL CHECK(requested_amount > 0),
+    currency TEXT NOT NULL DEFAULT 'USD',
+    topup_url TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','resolved','cancelled')),
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    user_chat_id INTEGER,
+    note TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_topup_status ON topup_requests(status);
+
+-- Baseline metric reading captured BEFORE an order is placed.
+-- Used by the verifier to compute the delta after the order completes.
+CREATE TABLE IF NOT EXISTS metric_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    platform TEXT NOT NULL,
+    target_url TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    baseline_value REAL NOT NULL CHECK(baseline_value >= 0),
+    captured_at TEXT NOT NULL,
+    raw_json TEXT,
+    order_uuid TEXT  -- linked when place_order succeeds
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_order ON metric_snapshots(order_uuid);
+
+-- Live feed for the dashboard. Append-only.
+CREATE TABLE IF NOT EXISTS agent_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(length(kind) > 0),
+    payload_json TEXT NOT NULL,
+    order_uuid TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_order ON agent_events(order_uuid);
+CREATE INDEX IF NOT EXISTS idx_events_time ON agent_events(occurred_at DESC);

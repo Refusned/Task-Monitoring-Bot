@@ -24,11 +24,44 @@ from typing import Any
 
 import httpx
 
-from adapters.base import Capability, PanelAdapter, ServiceOption, keywords_for_scenario
-from models import OrderSpec, Scenario
+from adapters.base import Capability, PanelAdapter, quote_from_mock
+from models import OrderSpec, Quote, SourcePlatform, TaskType, TopupInfo
 
 _BASE_URL = "https://smmcode.shop/api/reseller"
-_SERVICES_TTL_SECONDS = 300.0
+_SERVICES_TTL_SECONDS = 60.0
+
+# Real service-id catalog for known (platform, metric) tuples. Picked from the
+# live smmcode.shop catalogue (cheapest stable option per category as of demo,
+# discovered 2026-05-27 via POST /api/reseller/services). When a tuple is
+# missing here, get_quote() falls back to mock_quotes_csv from settings — the
+# architectural slot stays, the demo keeps working.
+_SMMCODE_SERVICE_ID_MAP: dict[tuple[SourcePlatform, TaskType], str] = {
+    # YouTube — original three.
+    (SourcePlatform.YOUTUBE, TaskType.LIKES): "9824",         # ~₽0.97/шт
+    (SourcePlatform.YOUTUBE, TaskType.VIEWS): "5744",         # ~₽0.25/шт
+    (SourcePlatform.YOUTUBE, TaskType.SUBSCRIBES): "10391",   # ~₽6.28/шт
+    # VKontakte.
+    (SourcePlatform.VK, TaskType.LIKES): "7042",              # ~₽0.14/шт
+    (SourcePlatform.VK, TaskType.SUBSCRIBES): "43",           # ~₽0.89/шт (группа/паблик)
+    (SourcePlatform.VK, TaskType.VIEWS): "74",                # ~₽0.003/шт
+    # Telegram.
+    (SourcePlatform.TELEGRAM, TaskType.SUBSCRIBES): "10077",  # ~₽0.05/шт
+    (SourcePlatform.TELEGRAM, TaskType.VIEWS): "9918",        # ~₽0.007/шт
+    # X (Twitter).
+    (SourcePlatform.X, TaskType.LIKES): "2998",               # ~₽0.36/шт
+    (SourcePlatform.X, TaskType.SUBSCRIBES): "10082",         # ~₽1.22/шт (followers)
+    (SourcePlatform.X, TaskType.VIEWS): "7819",               # ~₽0.003/шт
+    # Pinterest.
+    (SourcePlatform.PINTEREST, TaskType.LIKES): "6984",       # ~₽1.0/шт
+    (SourcePlatform.PINTEREST, TaskType.SUBSCRIBES): "1562",  # ~₽4.19/шт
+    # Yandex Дзен.
+    (SourcePlatform.DZEN, TaskType.LIKES): "1223",            # ~₽0.70/шт
+    (SourcePlatform.DZEN, TaskType.SUBSCRIBES): "8875",       # ~₽1.13/шт
+    (SourcePlatform.DZEN, TaskType.VIEWS): "8642",            # ~₽0.27/шт
+}
+
+# Day 3 audit MEDIUM-7: shorter TTL = less stale price risk.
+_SMMCODE_TOPUP_URL = "https://smmcode.shop/?do=funds"
 
 # Raw `status_id` -> normalized status. Source: docs/api/smmcode.md.
 _STATUS_MAP: dict[int, str] = {
@@ -63,8 +96,58 @@ class SmmcodeAdapter(PanelAdapter):
             Capability.CREATE_ORDER,
             Capability.GET_ORDER_STATUS,
             Capability.GET_BALANCE,
+            Capability.GET_QUOTE,
+            Capability.GET_TOPUP_INFO,
             # NB: reseller API does not accept client-side order ids.
         }
+
+    async def get_quote(
+        self, metric: TaskType, platform: SourcePlatform, quantity: int
+    ) -> Quote | None:
+        """Return a price quote. Tries real catalog via the hardcoded service-id
+        map (operator-curated); falls back to config mock if the tuple isn't mapped.
+        """
+        service_id = _SMMCODE_SERVICE_ID_MAP.get((platform, metric))
+        if service_id is not None:
+            try:
+                price_per_unit = await self._service_price(service_id)
+            except (KeyError, ValueError, RuntimeError, httpx.HTTPError):
+                price_per_unit = None
+            if price_per_unit is not None:
+                return Quote(
+                    exchange=self.name,
+                    service_id=service_id,
+                    metric=metric,
+                    platform=platform,
+                    quantity=quantity,
+                    price_per_unit=price_per_unit,
+                    total_price=price_per_unit * quantity,
+                    currency="RUB",
+                    eta_minutes_min=5,
+                    eta_minutes_max=60,
+                    confidence=0.9,
+                    raw={"source": "smmcode_catalog"},
+                )
+        # Fallback path: config-driven mock for the demo before service ids are wired.
+        from config import get_settings
+
+        return quote_from_mock(
+            self.name, metric, platform, quantity, get_settings().mock_quotes_csv,
+            confidence=0.4,
+        )
+
+    async def get_topup_info(self) -> TopupInfo:
+        return TopupInfo(
+            exchange=self.name,
+            topup_url=_SMMCODE_TOPUP_URL,
+            min_amount=100.0,
+            currency="RUB",
+            payment_methods=["card", "yoomoney", "usdt", "qiwi"],
+            notes=(
+                "Reseller cabinet; кошелёк биржи, не наш. "
+                "После пополнения баланс обновится в течение минуты."
+            ),
+        )
 
     async def get_balance(self) -> float:
         data = await self._post("balance", {})
@@ -115,51 +198,6 @@ class SmmcodeAdapter(PanelAdapter):
             safe_payload = {k: v for k, v in payload.items() if k != "api_token"}
             raise RuntimeError(f"smmcode {method} returned non-200 status: {safe_payload!r}")
         return payload
-
-    async def list_services_for_scenario(
-        self,
-        scenario: Scenario,
-        limit: int = 8,
-    ) -> list[ServiceOption]:
-        """Filter the cached `/services` catalogue by name keywords matching the
-        scenario. Sorted by price-per-unit ascending so the cheapest choice is
-        on top (typical demo flow wants the cheapest viable option).
-        """
-        services = await self._get_services()
-        keywords = keywords_for_scenario(scenario)
-        if not keywords:
-            return []
-        candidates: list[ServiceOption] = []
-        for svc in services.values():
-            name = str(svc.get("name", ""))
-            haystack = name.lower()
-            if not any(kw in haystack for kw in keywords):
-                continue
-            try:
-                price = float(svc.get("price", 0))
-            except (TypeError, ValueError):
-                price = 0.0
-            if price <= 0:
-                continue  # skip entries we can't cost-cap reliably
-            try:
-                min_q = int(svc.get("min", 0)) or None
-            except (TypeError, ValueError):
-                min_q = None
-            try:
-                max_q = int(svc.get("max", 0)) or None
-            except (TypeError, ValueError):
-                max_q = None
-            candidates.append(
-                ServiceOption(
-                    service_id=str(svc.get("service_id", svc.get("id", ""))),
-                    name=name,
-                    price_per_unit=price,
-                    min_quantity=min_q,
-                    max_quantity=max_q,
-                )
-            )
-        candidates.sort(key=lambda s: (s.price_per_unit or 0.0, s.name))
-        return candidates[:limit]
 
     async def _service_price(self, service_id: str) -> float:
         services = await self._get_services()

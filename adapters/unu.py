@@ -1,18 +1,22 @@
-"""Real adapter for the unu.im microtask-exchange API (v1).
+"""Real adapter for the unu.im microtask-exchange API.
 
-API form: POST form-encoded per-action endpoint, JSON responses,
-auth via `api_key` body param + `action`.
-Docs reference: `docs/api/unu.md`.
+API form: POST `https://unu.im/api` with body params `api_key` + `action` + per-action
+extras. Responses JSON: `{"success": int, "errors": text, ...payload}`. Docs reference:
+`docs/api/unu.md`.
 
 Notable behaviours:
 
-- **Estimate-first cost check** (HIGH-c invariant). Before placing, the adapter fetches
-  tariffs (cached), computes `cost = price * quantity`, and refuses if `max_cost` exceeded.
-- **Status mapping.** Raw numeric status codes are mapped per the tables in `docs/api/unu.md`.
-- **No client order id support.** The native v1 API does not accept client-side identifiers;
-  `client_order_uuid` (C1) lives only in our SQLite.
-- **add_task_start** is used for atomic create + limit set (preferred over `add_task` +
-  `task_limit_add` per docs).
+- **Estimate-first cost check** (HIGH-c invariant). Before placing, the adapter looks
+  up `tarif_id` price via cached `get_tariffs`, computes `cost = price * quantity`,
+  refuses if it exceeds `spec.max_cost`. `add_task_start` is NOT called when the cap
+  is exceeded.
+- **Order lifecycle = "task".** `add_task_start` creates+funds in one atomic call;
+  status read via `get_tasks` (raw `status`) and mapped to our normalized
+  `'in_progress' | 'completed' | 'failed'`.
+- **Submission lifecycle = "report".** `get_reports` lists pending reports;
+  `approve_report` / `reject_report` are the money actions.
+- **Client order id**: UNU does not support a client-side identifier; identity on
+  the exchange side is the returned `task_id`.
 """
 
 from __future__ import annotations
@@ -22,63 +26,45 @@ from typing import Any
 
 import httpx
 
-from adapters.base import Capability, ServiceOption, TaskExchangeAdapter, keywords_for_scenario
-from models import ExternalSubmission, OrderSpec, Scenario
+from adapters.base import Capability, TaskExchangeAdapter, quote_from_mock
+from models import ExternalSubmission, OrderSpec, Quote, SourcePlatform, TaskType, TopupInfo
 
 _BASE_URL = "https://unu.im/api"
-_SERVICES_TTL_SECONDS = 300.0
+_TARIFFS_TTL_SECONDS = 60.0
 
-
-def _extract_unu_evidence(messages: Any) -> str | None:
-    """Pull worker evidence text out of UNU's `messages` payload.
-
-    UNU returns messages as a list of dicts like `{"text": "...", ...}`. We
-    join the text fields into a single human-readable string. Returns `None`
-    if there are no messages — the verifier treats that as "no evidence",
-    which routes to NEEDS_HUMAN_REVIEW (safer than auto-pass).
-    """
-    if not isinstance(messages, list) or not messages:
-        return None
-    parts: list[str] = []
-    for m in messages:
-        if isinstance(m, dict):
-            text = m.get("text") or m.get("message") or m.get("body")
-            if text:
-                parts.append(str(text))
-        elif isinstance(m, str):
-            parts.append(m)
-    return "\n".join(parts) if parts else None
-
-
-# Task status (from get_tasks) raw -> normalized order status
+# Raw `task.status` (`get_tasks`) -> normalized status. Source: docs/api/unu.md.
 _TASK_STATUS_MAP: dict[int, str] = {
-    1: "in_progress",  # New, needs pay (limit=0) — should not happen with add_task_start
-    2: "completed",  # Limit reached (all executions done)
-    3: "failed",  # Stopped
+    1: "in_progress",  # New, needs pay
+    2: "completed",  # Limit reached
+    3: "failed",  # Stopped / cancelled
     4: "in_progress",  # Active
     5: "failed",  # Rejected by moderator
     6: "in_progress",  # On moderation
 }
 
-# Report status (from get_reports) raw -> normalized submission status
-_REPORT_STATUS_MAP: dict[int, str] = {
-    1: "new",  # In work
-    2: "awaiting_admin",  # On review
-    3: "rework_requested",  # On revision (we sent back)
-    6: "accepted",  # Paid
-}
+# Raw `report.status` (`get_reports`) -> only "awaiting_admin" reports need attention.
+# `2` = "on review" is the only one we surface for accept/reject (the others are
+# already terminal from our perspective: 1 in-work, 3 in-revision, 6 paid).
+_REPORT_STATUS_AWAITING = 2
 
 
 class UnuAdapter(TaskExchangeAdapter):
-    """unu.im microtask-exchange adapter."""
+    """unu.im task-exchange adapter."""
 
     name = "unu"
 
-    def __init__(self, api_key: str, http_client: httpx.AsyncClient) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        http_client: httpx.AsyncClient,
+        *,
+        default_folder_id: int = 0,
+    ) -> None:
         if not api_key:
             raise ValueError("unu api_key is required (set UNU_API_KEY in .env)")
         self._api_key = api_key
         self._client = http_client
+        self._default_folder_id = default_folder_id
         self._tariffs_cache: dict[str, dict[str, Any]] | None = None
         self._tariffs_cache_at: float = 0.0
 
@@ -90,203 +76,174 @@ class UnuAdapter(TaskExchangeAdapter):
             Capability.LIST_SUBMISSIONS,
             Capability.ACCEPT_SUBMISSION,
             Capability.REJECT_SUBMISSION,
+            Capability.GET_QUOTE,
+            Capability.GET_TOPUP_INFO,
+            # NB: UNU does not accept client-side order ids.
         }
 
+    async def get_quote(
+        self, metric: TaskType, platform: SourcePlatform, quantity: int
+    ) -> Quote | None:
+        """Mock-only for MVP. To go real: hardcode a tarif_id map and call
+        _tariff_price() — the tariff catalogue is already cached."""
+        from config import get_settings
+
+        return quote_from_mock(
+            self.name, metric, platform, quantity, get_settings().mock_quotes_csv,
+            confidence=0.4,
+        )
+
+    async def get_topup_info(self) -> TopupInfo:
+        return TopupInfo(
+            exchange=self.name,
+            topup_url="https://unu.im/?do=funds",
+            min_amount=100.0,
+            currency="RUB",
+            payment_methods=["card", "yoomoney", "qiwi", "webmoney"],
+            notes="Микрозадачная биржа; пополняется в личном кабинете.",
+        )
+
+    # --- balance + create -----------------------------------------------------
+
     async def get_balance(self) -> float:
-        data = await self._post({"action": "get_balance"})
-        return float(data.get("balance", 0.0))
+        data = await self._post("get_balance", {})
+        return float(data["balance"])
 
     async def create_order(self, spec: OrderSpec, client_order_uuid: str) -> tuple[str, float]:
-        # Estimate-first: fetch tariffs, compute cost, enforce max_cost.
-        price_per_unit = await self._tariff_price(spec.service_id or "1")
+        if not spec.service_id:
+            raise ValueError("unu requires spec.service_id (tarif_id from get_tariffs)")
+        price_per_unit = await self._tariff_price(spec.service_id)
         cost = price_per_unit * spec.quantity
         if cost > spec.max_cost:
             raise ValueError(f"computed cost {cost:.2f} exceeds spec.max_cost {spec.max_cost:.2f}")
 
-        # For MVP: simple mapping. We pick a default folder_id=1; in production
-        # the orchestrator should pass folder_id via spec.service_id or config.
-        # We use add_task_start to create and fund the task atomically.
-        body: dict[str, Any] = {
-            "action": "add_task_start",
-            "name": spec.scenario,
-            "descr": f"Order via bot for {spec.target}",
-            "need_for_report": 1,
+        params: dict[str, Any] = {
+            "name": f"order-{client_order_uuid[:8]}",
+            "descr": spec.target,
+            "need_for_report": spec.target,
             "price": str(price_per_unit),
-            "tarif_id": str(spec.service_id or "1"),
-            "folder_id": "1",
+            "tarif_id": str(spec.service_id),
+            "folder_id": str(self._default_folder_id),
             "add_to_limit": str(spec.quantity),
             "link": spec.target,
         }
-        data = await self._post(body)
-        external_id = str(data.get("task_id"))
-        if not external_id:
-            raise RuntimeError(f"unu add_task_start returned no task_id: {data!r}")
+        data = await self._post("add_task_start", params)
+        external_id = str(data["task_id"])
         return external_id, cost
 
     async def get_order_status(self, external_order_id: str) -> str:
-        data = await self._post({"action": "get_tasks", "task_id": str(external_order_id)})
-        tasks = data.get("tasks")
-        if not isinstance(tasks, list) or not tasks:
+        data = await self._post("get_tasks", {"task_id": str(external_order_id)})
+        tasks = data.get("tasks") or []
+        if not tasks:
             return "failed"
-        task = tasks[0]
-        raw_status = int(task.get("status", 0))
+        task = tasks[0] if isinstance(tasks, list) else tasks
+        try:
+            raw_status = int(task.get("status", 0))
+        except (TypeError, ValueError):
+            return "failed"
         return _TASK_STATUS_MAP.get(raw_status, "failed")
 
+    # --- submissions ----------------------------------------------------------
+
     async def list_submissions(self, external_order_id: str) -> list[ExternalSubmission]:
-        data = await self._post({"action": "get_reports", "task_id": str(external_order_id)})
-        reports = data.get("reports")
-        if not isinstance(reports, list):
-            return []
+        data = await self._post("get_reports", {"task_id": str(external_order_id)})
+        reports = data.get("reports") or []
         results: list[ExternalSubmission] = []
-        for report in reports:
-            if not isinstance(report, dict):
+        for r in reports:
+            if not isinstance(r, dict):
                 continue
-            raw_status = int(report.get("status", 0))
-            # Only include reports that are still pending a decision (status 1 or 2).
-            if raw_status not in (1, 2):
+            try:
+                status = int(r.get("status", 0))
+            except (TypeError, ValueError):
                 continue
+            if status != _REPORT_STATUS_AWAITING:
+                continue
+            report_id = r.get("id")
+            if report_id is None:
+                continue
+            messages = r.get("messages")
+            evidence = self._extract_evidence(messages)
+            worker_id = r.get("worker_id")
             results.append(
                 ExternalSubmission(
-                    external_submission_id=str(report.get("id")),
-                    executor_hint=str(report.get("worker_id")) if report.get("worker_id") else None,
-                    evidence=_extract_unu_evidence(report.get("messages")),
+                    external_submission_id=str(report_id),
+                    executor_hint=str(worker_id) if worker_id is not None else None,
+                    evidence=evidence,
                 )
             )
         return results
 
     async def accept_submission(self, external_order_id: str, external_submission_id: str) -> None:
-        await self._post(
-            {
-                "action": "approve_report",
-                "report_id": str(external_submission_id),
-            }
-        )
+        # UNU's approve_report takes only report_id; external_order_id is accepted
+        # for interface compatibility but not sent (the report row already references it).
+        await self._post("approve_report", {"report_id": str(external_submission_id)})
 
     async def reject_submission(
         self, external_order_id: str, external_submission_id: str, reason: str
     ) -> None:
+        # reject_type=1 -> "to revision" (rework). reject_type=2 would refuse outright.
         await self._post(
+            "reject_report",
             {
-                "action": "reject_report",
                 "report_id": str(external_submission_id),
-                "comment": reason,
-                "reject_type": "1",  # to revision
-            }
+                "comment": reason or "rework requested",
+                "reject_type": "1",
+            },
         )
 
-    async def list_services_for_scenario(
-        self,
-        scenario: Scenario,
-        limit: int = 8,
-    ) -> list[ServiceOption]:
-        """Pick UNU tariffs whose name matches scenario keywords. UNU uses
-        `min_price_rub` as the price floor; we treat it as the assumed
-        per-unit price for the picker label.
-        """
-        tariffs = await self._get_tariffs()
-        keywords = keywords_for_scenario(scenario)
-        if not keywords:
-            return []
-        candidates: list[ServiceOption] = []
-        for tariff in tariffs.values():
-            name = str(tariff.get("name", ""))
-            haystack = name.lower()
-            if not any(kw in haystack for kw in keywords):
-                continue
-            price = None
-            for key in ("min_price_rub", "price", "cost"):
-                raw = tariff.get(key)
-                if raw is None:
-                    continue
-                try:
-                    val = float(raw)
-                except (TypeError, ValueError):
-                    continue
-                if val > 0:
-                    price = val
-                    break
-            if price is None:
-                continue  # no usable price → skip (money-safety)
-            candidates.append(
-                ServiceOption(
-                    service_id=str(tariff.get("id", "")),
-                    name=name,
-                    price_per_unit=price,
-                )
-            )
-        candidates.sort(key=lambda s: (s.price_per_unit or 0.0, s.name))
-        return candidates[:limit]
+    # --- internal helpers -----------------------------------------------------
 
-    # --- internal helpers --------------------------------------------------
-
-    async def _post(self, params: dict[str, Any]) -> dict[str, Any]:
-        url = _BASE_URL
-        body = {"api_key": self._api_key, **params}
-        response = await self._client.post(url, data=body)
+    async def _post(self, action: str, params: dict[str, Any]) -> dict[str, Any]:
+        body = {"api_key": self._api_key, "action": action, **params}
+        response = await self._client.post(_BASE_URL, data=body)
         response.raise_for_status()
         payload = response.json()
-        # UNU envelope: {"success": int, "errors": text, ...payload}
-        if payload.get("success") not in (1, "1", True):
-            errors = payload.get("errors", payload.get("error", "unknown error"))
+        try:
+            success = int(payload.get("success", 0))
+        except (TypeError, ValueError):
+            success = 0
+        if success != 1:
+            # Strip api_key from the diagnostic; surface the rest.
             safe = {k: v for k, v in payload.items() if k != "api_key"}
-            raise RuntimeError(f"unu error ({errors!r}): {safe!r}")
+            raise RuntimeError(f"unu {action} returned non-success payload: {safe!r}")
         return payload
 
-    async def _tariff_price(self, tariff_id: str) -> float:
-        """Estimate-first price-per-execution for the given tariff.
-
-        UNU exposes tariffs with a `min_price_rub` field (the floor — minimum
-        accepted price per unit). For estimate-first cost capping we treat the
-        floor as the assumed price: if even the floor times quantity exceeds
-        spec.max_cost, placement is refused. This prevents the worst-case
-        (CRITICAL money-safety): a missing/renamed field returning 0.0, which
-        would silently bypass the cost cap and let the bot place an order at
-        whatever price UNU assigns server-side.
-
-        Probe order (first non-zero wins):
-          1. `min_price_rub` — current UNU field (verified live, 2026-05).
-          2. `price`         — historic field, kept for compat.
-          3. `cost`          — historic field, kept for compat.
-
-        If none of these is positive, we raise loudly — better a refused order
-        than a $$-leak.
-        """
+    async def _tariff_price(self, tarif_id: str) -> float:
         tariffs = await self._get_tariffs()
-        tariff = tariffs.get(str(tariff_id))
+        tariff = tariffs.get(str(tarif_id))
         if tariff is None:
-            raise ValueError(f"unu: tariff_id {tariff_id} not found")
-        for key in ("min_price_rub", "price", "cost"):
-            raw = tariff.get(key)
-            if raw is None:
-                continue
-            try:
-                price = float(raw)
-            except (TypeError, ValueError):
-                continue
-            if price > 0:
-                return price
-        raise ValueError(
-            f"unu: tariff_id {tariff_id} has no usable price field "
-            f"(tried min_price_rub/price/cost); refusing to place an order "
-            f"without a real price — UNU API contract may have changed"
-        )
+            raise ValueError(f"unu: tarif_id {tarif_id} not in catalogue")
+        return float(tariff["price"])
 
     async def _get_tariffs(self) -> dict[str, dict[str, Any]]:
         if (
             self._tariffs_cache is None
-            or time.monotonic() - self._tariffs_cache_at > _SERVICES_TTL_SECONDS
+            or time.monotonic() - self._tariffs_cache_at > _TARIFFS_TTL_SECONDS
         ):
-            data = await self._post({"action": "get_tariffs"})
-            raw = data.get("tariffs") or data.get("data") or []
+            data = await self._post("get_tariffs", {})
+            raw = data.get("tariffs") or []
             flat: dict[str, dict[str, Any]] = {}
-            if isinstance(raw, list):
-                for t in raw:
-                    if isinstance(t, dict) and "id" in t:
-                        flat[str(t["id"])] = t
-            elif isinstance(raw, dict):
-                for k, v in raw.items():
-                    if isinstance(v, dict):
-                        flat[str(k)] = v
+            for t in raw:
+                if isinstance(t, dict) and "id" in t and "price" in t:
+                    flat[str(t["id"])] = t
             self._tariffs_cache = flat
             self._tariffs_cache_at = time.monotonic()
         return self._tariffs_cache
+
+    @staticmethod
+    def _extract_evidence(messages: Any) -> str | None:
+        """Pull the worker's evidence text from UNU's `messages[]` payload.
+
+        The contract is loose (text snippet, URL, screenshot id, ...); the
+        verifier consumes the raw blob. None when the report carries no message.
+        """
+        if not isinstance(messages, list) or not messages:
+            return None
+        first = messages[0]
+        if isinstance(first, dict):
+            text = first.get("text") or first.get("message") or first.get("body")
+            if text:
+                return str(text)
+        if isinstance(first, str):
+            return first
+        return None

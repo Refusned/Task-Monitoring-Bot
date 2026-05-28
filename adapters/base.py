@@ -15,10 +15,9 @@ subclass; this prevents consumers from calling them blindly via the base type.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from enum import StrEnum
 
-from models import ExternalSubmission, OrderSpec, Scenario
+from models import ExternalSubmission, OrderSpec, Quote, SourcePlatform, TaskType, TopupInfo
 
 
 class Capability(StrEnum):
@@ -33,67 +32,9 @@ class Capability(StrEnum):
     ACCEPT_SUBMISSION = "accept_submission"
     REJECT_SUBMISSION = "reject_submission"
     SUPPORTS_CLIENT_ORDER_ID = "supports_client_order_id"
-
-
-@dataclass(frozen=True, slots=True)
-class ServiceOption:
-    """A single picker option in the bot's «choose service» step.
-
-    Adapters convert their native catalogue entries into `ServiceOption`s so the
-    bot can render them as inline buttons without knowing the per-exchange JSON
-    shape. `price_per_unit` is in RUB where applicable; `None` means the price
-    can't be known up front (advego order_types) and the cost cap will kick in
-    against a conservative server-side floor at placement time.
-    """
-
-    service_id: str
-    name: str
-    price_per_unit: float | None = None
-    min_quantity: int | None = None
-    max_quantity: int | None = None
-
-    @property
-    def button_label(self) -> str:
-        """Short label fit for an inline-keyboard button (Telegram caps ~64 chars)."""
-        bits: list[str] = [self.name[:38]]
-        if self.price_per_unit is not None and self.price_per_unit > 0:
-            bits.append(f"₽{self.price_per_unit:g}/шт")
-        if self.min_quantity is not None and self.min_quantity > 1:
-            bits.append(f"≥{self.min_quantity}")
-        return " · ".join(bits)
-
-
-# Scenario → list of lower-case substrings to match against service names.
-# Each adapter's catalogue uses its own naming conventions; these keywords
-# cover the common Russian + English wording on smmcode/unu/advego.
-_SCENARIO_KEYWORDS: dict[Scenario, tuple[str, ...]] = {
-    Scenario.ACTIVITY_SUBSCRIBE: (
-        "подпис",  # Подписчики / Подписка
-        "follow",
-        "subscrib",
-    ),
-    Scenario.ACTIVITY_LIKE: (
-        "лайк",
-        "like",
-        "оценк",
-        "сердечк",
-        "нравит",
-    ),
-    Scenario.SOCIAL_TRAFFIC: (
-        "переход",
-        "трафик",
-        "traffic",
-        "посет",
-        "visit",
-        "click",
-        "клик",
-    ),
-}
-
-
-def keywords_for_scenario(scenario: Scenario) -> tuple[str, ...]:
-    """Return the substring filters used by adapters to narrow the catalogue."""
-    return _SCENARIO_KEYWORDS.get(scenario, ())
+    # v4 agent pivot
+    GET_QUOTE = "get_quote"
+    GET_TOPUP_INFO = "get_topup_info"
 
 
 class ExchangeAdapter(ABC):
@@ -107,19 +48,79 @@ class ExchangeAdapter(ABC):
     @abstractmethod
     async def get_balance(self) -> float: ...
 
-    async def list_services_for_scenario(
-        self,
-        scenario: Scenario,
-        limit: int = 8,
-    ) -> list[ServiceOption]:
-        """Return up to `limit` services from this exchange's catalogue that
-        plausibly satisfy `scenario`.
+    # ----- v4 agent pivot: optional methods (non-abstract; default = unsupported)
+    async def get_quote(
+        self, metric: TaskType, platform: SourcePlatform, quantity: int
+    ) -> Quote | None:
+        """Return a price quote for this (metric, platform, qty) on this exchange.
+        Default: not supported. Adapters override to declare support."""
+        return None
 
-        Adapters override this with a real catalogue fetch + keyword filter.
-        The base implementation returns an empty list — this surfaces honestly
-        to the bot's UI as "manual entry only" rather than crashing.
-        """
-        return []
+    async def get_topup_info(self) -> TopupInfo | None:
+        """Return how to fund this exchange (URL + min + methods).
+        Default: not supported. Adapters override with hardcoded URLs."""
+        return None
+
+
+# ----- Shared helpers for adapter authors --------------------------------
+
+def parse_mock_quotes(csv: str) -> dict[tuple[str, str, str], dict]:
+    """Parse mock_quotes_csv (see config.Settings) into a (ex,pl,met) lookup."""
+    out: dict[tuple[str, str, str], dict] = {}
+    for entry in csv.split(","):
+        entry = entry.strip()
+        if not entry or "=" not in entry:
+            continue
+        key, val = entry.split("=", 1)
+        parts = key.strip().split(":")
+        if len(parts) != 3:
+            continue
+        exchange, platform, metric = parts
+        price_eta = val.strip().split(";")
+        if len(price_eta) != 3:
+            continue
+        try:
+            price = float(price_eta[0])
+            eta_min = int(price_eta[1])
+            eta_max = int(price_eta[2])
+        except ValueError:
+            continue
+        out[(exchange.lower(), platform.lower(), metric.lower())] = {
+            "price_per_unit": price,
+            "eta_min": eta_min,
+            "eta_max": eta_max,
+        }
+    return out
+
+
+def quote_from_mock(
+    adapter_name: str,
+    metric: TaskType,
+    platform: SourcePlatform,
+    quantity: int,
+    mock_quotes_csv: str,
+    service_id: str | None = None,
+    confidence: float = 0.5,
+) -> Quote | None:
+    """Build a Quote from the config mock table. None if combo not mocked."""
+    table = parse_mock_quotes(mock_quotes_csv)
+    key = (adapter_name.lower(), platform.value, metric.value)
+    entry = table.get(key)
+    if entry is None:
+        return None
+    return Quote(
+        exchange=adapter_name,
+        service_id=service_id or f"mock-{platform.value}-{metric.value}",
+        metric=metric,
+        platform=platform,
+        quantity=quantity,
+        price_per_unit=entry["price_per_unit"],
+        total_price=entry["price_per_unit"] * quantity,
+        eta_minutes_min=entry["eta_min"],
+        eta_minutes_max=entry["eta_max"],
+        confidence=confidence,
+        raw={"source": "mock_config"},
+    )
 
 
 class PanelAdapter(ExchangeAdapter):

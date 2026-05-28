@@ -1,0 +1,21 @@
+[Unit]
+Description=SMM Agent FastAPI backend
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/smm-agent
+Environment=HOME=/root
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/smm-agent/scripts/run_backend.sh
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

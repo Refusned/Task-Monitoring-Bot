@@ -1,1 +1,36 @@
-{"reports": [{"id": 111, "task_id": 98765, "worker_id": 42, "status": 2, "messages": ["done"]}, {"id": 112, "task_id": 98765, "worker_id": 43, "status": 1, "messages": []}], "success": 1}
+{
+    "success": 1,
+    "reports": [
+        {
+            "id": 5001,
+            "task_id": 778899,
+            "worker_id": 42,
+            "price_rub": 0.5,
+            "status": 2,
+            "IP": "127.0.0.1",
+            "messages": [
+                {"text": "Подписался, скрин: https://i.imgur.com/abc.png"}
+            ]
+        },
+        {
+            "id": 5002,
+            "task_id": 778899,
+            "worker_id": 43,
+            "price_rub": 0.5,
+            "status": 1,
+            "IP": "127.0.0.1",
+            "messages": []
+        },
+        {
+            "id": 5003,
+            "task_id": 778899,
+            "worker_id": 44,
+            "price_rub": 0.5,
+            "status": 2,
+            "IP": "127.0.0.1",
+            "messages": [
+                {"text": "Done"}
+            ]
+        }
+    ]
+}

@@ -1,193 +1,611 @@
-"""Order lifecycle orchestrator: polling → verify → accept/reject.
+"""Order lifecycle orchestrator.
 
-Implements the core state-machine loop:
-  ACTIVE ──poll──▶ VERIFYING ──verify──▶ ACCEPTING / REJECTING / AWAITING_ADMIN
+Owns the state machine: creates orders, polls them, processes submissions (for
+microtask exchanges), and performs accept/reject actions through the C2
+idempotency pattern.
 
-Money-safety (C1/C2):
-- C1 (no double-create): handled in cli.py/database.py (CREATING → ACTIVE).
-- C2 (no double-pay): payments.UNIQUE(exchange, external_submission_id) +
-  action_log claim → commit → external call → record pattern.
+## State machine
 
-The orchestrator does NOT hold long DB transactions across HTTP calls.
+Order:
+
+    DRAFT -> CREATING -> ACTIVE -> VERIFYING -> COMPLETED
+                            |         |
+                            +-> FAILED <-+
+                          (and CANCELLED for admin-initiated; not in Day 3)
+
+Submission (microtask exchanges only):
+
+    NEW -> VERIFYING -> AWAITING_ADMIN
+                            |
+                            +-> ACCEPTING  -> ACCEPTED
+                            +-> REJECTING  -> REWORK_REQUESTED
+                            +-> (either)   -> FAILED  (external call errored)
+
+## Money invariants
+
+- **C1** - no duplicate placement. `insert_order_creating` writes the CREATING
+  row before the adapter call; `mark_order_active` requires the row to still be
+  in CREATING. `reconcile_creating` only acts on rows older than
+  `min_age_seconds` (default 300) so it never races with a live create.
+
+- **C2** - no double accept/reject. Race-safety relies on three SQLite-level
+  guards:
+    1. `UNIQUE(order_uuid, external_submission_id)` on `submissions` + INSERT
+       OR IGNORE in `ensure_submission_persisted` - one local row per external
+       submission.
+    2. Every status transition during a money action is a CONDITIONAL UPDATE
+       (`claim_submission_action`, `claim_submission_and_open_action`). A stale
+       reader can never overwrite a later state.
+    3. The claim and the `action_log` open are committed in the SAME
+       transaction; the external HTTP call happens between commits, never
+       inside one. `payments` PRIMARY KEY (exchange, external_submission_id)
+       keeps the terminal record unique even if a replay reaches the recorder.
 """
 
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
-from adapters.base import Capability, ExchangeAdapter, TaskExchangeAdapter
+from adapters.base import ExchangeAdapter, PanelAdapter, TaskExchangeAdapter
 from config import Settings
 from db.database import (
     append_audit,
+    claim_order_status,
     claim_submission_action,
     claim_submission_and_open_action,
+    complete_action_log,
     connect,
+    count_non_terminal_submissions_for_order,
     ensure_submission_persisted,
     get_order,
     get_submission,
-    get_submissions_for_order,
-    insert_report_row,
-    insert_verification,
-    list_active_orders,
     list_order_uuids_in_status_older_than,
-    payment_exists,
-    record_action_failure,
-    record_action_success,
+    mark_order_active,
+    record_payment,
+    reserve_order_creating_with_spend_limits,
     update_order_status,
-    update_submission_status,
 )
 from models import (
     Order,
+    OrderSpec,
     OrderStatus,
-    Scenario,
     Submission,
     SubmissionStatus,
     VerificationResult,
     VerificationVerdict,
+    new_client_order_uuid,
 )
-from verification.activity import ActivityVerifier
-from verification.traffic import TrafficVerifier
+from verification.fake import verify_panel_completion, verify_submission
+
+
+async def persist_and_create_order(
+    settings: Settings,
+    adapter: ExchangeAdapter,
+    spec: OrderSpec,
+    actor: str,
+    client_uuid: str | None = None,
+) -> tuple[str, str, float]:
+    """C1: write the CREATING row, call adapter.create_order, mark ACTIVE.
+
+    On adapter failure, moves the CREATING row to FAILED and re-raises so the
+    audit log reflects what actually happened (HIGH-a invariant: no silent
+    transitions).
+
+    Returns (client_order_uuid, external_order_id, cost).
+    """
+    if not isinstance(adapter, (PanelAdapter, TaskExchangeAdapter)):
+        raise TypeError(f"adapter {adapter.name!r} cannot create orders")
+
+    now = datetime.now(UTC)
+    client_uuid = client_uuid or new_client_order_uuid()
+    order = Order(
+        client_order_uuid=client_uuid,
+        spec=spec,
+        status=OrderStatus.CREATING,
+        created_at=now,
+        updated_at=now,
+    )
+    async with connect(settings) as conn:
+        await reserve_order_creating_with_spend_limits(
+            conn,
+            order,
+            per_order_limit=settings.per_order_spend_limit,
+            daily_limit=settings.daily_spend_limit,
+        )
+        await append_audit(
+            conn,
+            actor=actor,
+            event="order_creating",
+            order_uuid=client_uuid,
+            details={
+                "exchange": spec.exchange,
+                "scenario": spec.scenario.value,
+                "target": spec.target,
+            },
+        )
+
+    try:
+        external_id, cost = await adapter.create_order(spec, client_uuid)
+    except Exception as exc:
+        async with connect(settings) as conn:
+            await update_order_status(conn, client_uuid, OrderStatus.FAILED)
+            await append_audit(
+                conn,
+                actor=actor,
+                event="order_create_failed",
+                order_uuid=client_uuid,
+                details={"error": str(exc), "error_type": type(exc).__name__},
+            )
+        raise
+
+    async with connect(settings) as conn:
+        await mark_order_active(conn, client_uuid, external_id, cost)
+        await append_audit(
+            conn,
+            actor=actor,
+            event="order_active",
+            order_uuid=client_uuid,
+            details={"external_order_id": external_id, "cost": cost},
+        )
+    return client_uuid, external_id, cost
 
 
 class Orchestrator:
-    """Drives the order lifecycle for all active orders."""
+    """Drives orders through their lifecycle.
 
-    def __init__(
-        self,
-        settings: Settings,
-        adapters: Mapping[str, ExchangeAdapter],
-        activity_verifier: ActivityVerifier | None = None,
-        traffic_verifier: TrafficVerifier | None = None,
-    ) -> None:
+    Holds a registry of adapters keyed by exchange name. Methods read state from
+    SQLite, ask the adapter what's happening on the exchange side, and advance
+    the state machine - writing every transition to the audit log.
+    """
+
+    def __init__(self, settings: Settings, adapters: dict[str, ExchangeAdapter]) -> None:
         self._settings = settings
         self._adapters = adapters
-        self._activity_verifier = activity_verifier or ActivityVerifier(mock=settings.dry_run)
-        self._traffic_verifier = traffic_verifier or TrafficVerifier(
-            counter_id=settings.metrica_counter_id,
-            oauth_token=settings.metrica_oauth_token,
-            mock=settings.dry_run,
-            verification_window_days=settings.metrica_verification_window_days,
+
+    def adapter_for(self, exchange_name: str) -> ExchangeAdapter:
+        adapter = self._adapters.get(exchange_name)
+        if adapter is None:
+            raise ValueError(f"no adapter registered for exchange {exchange_name!r}")
+        return adapter
+
+    async def create_order(self, spec: OrderSpec, actor: str) -> tuple[str, str, float]:
+        return await persist_and_create_order(
+            self._settings, self.adapter_for(spec.exchange), spec, actor
         )
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    async def poll_all(self) -> list[dict[str, Any]]:
-        """Poll every ACTIVE/VERIFYING order and return a summary per order."""
+    async def poll_order(self, client_order_uuid: str, actor: str = "system") -> OrderStatus:
+        """Advance the order one tick. Returns the new OrderStatus."""
         async with connect(self._settings) as conn:
-            orders = await list_active_orders(conn)
-
-        results: list[dict[str, Any]] = []
-        for order in orders:
-            try:
-                summary = await self._poll_one(order)
-            except Exception as exc:
-                summary = {
-                    "order_uuid": order.client_order_uuid,
-                    "exchange": order.spec.exchange,
-                    "status": "error",
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            results.append(summary)
-        return results
-
-    async def verify_single_order(self, order_uuid: str) -> dict[str, Any]:
-        """Manually trigger verification for a single order (CLI / Telegram)."""
-        async with connect(self._settings) as conn:
-            order = await get_order(conn, order_uuid)
+            order = await get_order(conn, client_order_uuid)
         if order is None:
-            return {"order_uuid": order_uuid, "status": "not_found"}
+            raise ValueError(f"order {client_order_uuid!r} not found")
         if order.status not in (OrderStatus.ACTIVE, OrderStatus.VERIFYING):
-            return {
-                "order_uuid": order_uuid,
-                "status": "skipped",
-                "reason": f"order status is {order.status.value}, not active/verifying",
-            }
-        return await self._poll_one(order)
+            return order.status  # terminal / pre-active - nothing to do
+        if order.external_order_id is None:
+            return order.status  # defensive - shouldn't happen for ACTIVE
 
-    async def admin_accept_submission(self, submission_uuid: str, actor: str) -> dict[str, Any]:
-        """Accept a human-reviewed submission through the same C2 guard as auto-accept."""
-        if self._settings.dry_run:
-            return {
-                "submission_uuid": submission_uuid,
-                "status": "dry_run_blocked",
-                "reason": "DRY_RUN=true: external accept is disabled",
-            }
-        order, sub, adapter_or_error = await self._load_admin_decision_context(submission_uuid)
-        if isinstance(adapter_or_error, dict):
-            return adapter_or_error
-        adapter = adapter_or_error
-        result = VerificationResult(
-            verdict=VerificationVerdict.AUTO_PASS,
-            measured=float(order.spec.quantity),
-            expected=float(order.spec.quantity),
-            reason=f"manual accept by {actor}",
-            raw_evidence={"mode": "admin", "actor": actor},
-        )
-        decision = await self._accept_submission(order, adapter, sub, result, decided_by=actor)
-        await self._complete_order_if_all_submissions_terminal(order)
-        await self._audit(
-            "admin_accept",
-            order.client_order_uuid,
-            {"submission_uuid": submission_uuid, "actor": actor, "decision": decision},
-        )
-        return decision
+        adapter = self.adapter_for(order.spec.exchange)
+        raw_status = await adapter.get_order_status(order.external_order_id)
 
-    async def admin_reject_submission(
+        async with connect(self._settings) as conn:
+            await append_audit(
+                conn,
+                actor=actor,
+                event="poll",
+                order_uuid=client_order_uuid,
+                details={"raw_status": raw_status},
+            )
+
+        if raw_status == "failed":
+            async with connect(self._settings) as conn:
+                claimed = await claim_order_status(
+                    conn,
+                    client_order_uuid,
+                    target=OrderStatus.FAILED,
+                    allowed_from=(OrderStatus.ACTIVE, OrderStatus.VERIFYING),
+                    raw_exchange_status=raw_status,
+                )
+                if not claimed:
+                    current = await get_order(conn, client_order_uuid)
+                    return current.status if current else OrderStatus.FAILED
+                await append_audit(
+                    conn,
+                    actor=actor,
+                    event="order_failed",
+                    order_uuid=client_order_uuid,
+                )
+            return OrderStatus.FAILED
+
+        if isinstance(adapter, TaskExchangeAdapter):
+            await self._process_submissions(adapter, order, actor)
+
+        if raw_status == "completed":
+            return await self._finalize_completed_order(adapter, order, actor)
+
+        return order.status  # still ACTIVE / VERIFYING
+
+    async def _process_submissions(
+        self,
+        adapter: TaskExchangeAdapter,
+        order: Order,
+        actor: str,
+    ) -> None:
+        """For task-exchange orders: list submissions, persist new ones, decide.
+
+        Day 3 audit fixes:
+        - Submission persistence uses INSERT OR IGNORE (UNIQUE constraint),
+          so concurrent pollers converge on a single local row (CRITICAL-1).
+        - Status transitions use claim_submission_action - a conditional UPDATE
+          that refuses to overwrite a more-progressed state (CRITICAL-2).
+        - A loser of either race simply skips the submission and moves on.
+        """
+        assert order.external_order_id is not None
+        external_subs = await adapter.list_submissions(order.external_order_id)
+        for ext_sub in external_subs:
+            candidate = Submission(
+                submission_uuid=str(uuid.uuid4()),
+                order_uuid=order.client_order_uuid,
+                external_submission_id=ext_sub.external_submission_id,
+                executor_hint=ext_sub.executor_hint,
+                status=SubmissionStatus.NEW,
+                evidence=ext_sub.evidence,
+                created_at=datetime.now(UTC),
+            )
+            async with connect(self._settings) as conn:
+                sub, inserted_now = await ensure_submission_persisted(
+                    conn, candidate, order.spec.exchange
+                )
+                if inserted_now:
+                    await append_audit(
+                        conn,
+                        actor=actor,
+                        event="submission_new",
+                        submission_uuid=sub.submission_uuid,
+                        order_uuid=order.client_order_uuid,
+                        details={"external_submission_id": ext_sub.external_submission_id},
+                    )
+
+            # CRITICAL-2 fix: NEW -> VERIFYING via conditional UPDATE.
+            # If the row is no longer NEW (another worker progressed it, or it's
+            # already terminal) the claim fails and we skip - we MUST NOT roll
+            # state back.
+            async with connect(self._settings) as conn:
+                claimed_verification = await claim_submission_action(
+                    conn,
+                    sub.submission_uuid,
+                    target=SubmissionStatus.VERIFYING,
+                    allowed_from=(SubmissionStatus.NEW,),
+                )
+            if not claimed_verification:
+                continue  # already past NEW - someone else is handling this submission
+
+            result = verify_submission(sub.evidence)
+            if (
+                not self._settings.dry_run
+                and result.verdict == VerificationVerdict.AUTO_PASS
+                and result.reason.startswith("demo-verdict:")
+            ):
+                result = VerificationResult(
+                    verdict=VerificationVerdict.NEEDS_HUMAN_REVIEW,
+                    measured=result.measured,
+                    expected=result.expected,
+                    reason="live mode: demo verifier cannot auto-accept paid submissions",
+                    raw_evidence=result.raw_evidence,
+                )
+            async with connect(self._settings) as conn:
+                await append_audit(
+                    conn,
+                    actor=actor,
+                    event="submission_verified",
+                    submission_uuid=sub.submission_uuid,
+                    order_uuid=order.client_order_uuid,
+                    details={"verdict": result.verdict.value, "reason": result.reason},
+                )
+
+            if result.verdict == VerificationVerdict.AUTO_PASS:
+                await self.accept_submission(sub.submission_uuid, decided_by=f"auto:{actor}")
+            elif result.verdict == VerificationVerdict.FAIL:
+                await self.reject_submission(
+                    sub.submission_uuid,
+                    reason=result.reason,
+                    decided_by=f"auto:{actor}",
+                )
+            else:  # NEEDS_HUMAN_REVIEW
+                async with connect(self._settings) as conn:
+                    # VERIFYING -> AWAITING_ADMIN, also conditional (CRITICAL-2).
+                    await claim_submission_action(
+                        conn,
+                        sub.submission_uuid,
+                        target=SubmissionStatus.AWAITING_ADMIN,
+                        allowed_from=(SubmissionStatus.VERIFYING,),
+                    )
+                    await append_audit(
+                        conn,
+                        actor=actor,
+                        event="submission_awaiting_admin",
+                        submission_uuid=sub.submission_uuid,
+                        order_uuid=order.client_order_uuid,
+                    )
+
+    async def _finalize_completed_order(
+        self,
+        adapter: ExchangeAdapter,
+        order: Order,
+        actor: str,
+    ) -> OrderStatus:
+        """raw_status == 'completed': ACTIVE -> VERIFYING -> COMPLETED / FAILED.
+
+        For task-exchange orders, audit HIGH-5 fix: do NOT close the order while
+        any local submission is still non-terminal (NEW / VERIFYING /
+        AWAITING_ADMIN / ACCEPTING / REJECTING). Keep it in VERIFYING and let a
+        future poll close it once all submissions reach a terminal state.
+        """
+        if order.status == OrderStatus.ACTIVE:
+            async with connect(self._settings) as conn:
+                claimed = await claim_order_status(
+                    conn,
+                    order.client_order_uuid,
+                    target=OrderStatus.VERIFYING,
+                    allowed_from=(OrderStatus.ACTIVE,),
+                    raw_exchange_status="completed",
+                )
+                if not claimed:
+                    current = await get_order(conn, order.client_order_uuid)
+                    return current.status if current else order.status
+
+        if isinstance(adapter, PanelAdapter):
+            verdict = verify_panel_completion(order)
+            if (
+                not self._settings.dry_run
+                and verdict.verdict == VerificationVerdict.AUTO_PASS
+                and verdict.reason.startswith("demo-verdict:")
+            ):
+                verdict = VerificationResult(
+                    verdict=VerificationVerdict.NEEDS_HUMAN_REVIEW,
+                    measured=verdict.measured,
+                    expected=verdict.expected,
+                    reason="live mode: demo panel verifier cannot auto-complete paid orders",
+                    raw_evidence=verdict.raw_evidence,
+                )
+                async with connect(self._settings) as conn:
+                    await append_audit(
+                        conn,
+                        actor=actor,
+                        event="panel_verification",
+                        order_uuid=order.client_order_uuid,
+                        details={"verdict": verdict.verdict.value, "reason": verdict.reason},
+                    )
+                return OrderStatus.VERIFYING
+            final = (
+                OrderStatus.COMPLETED
+                if verdict.verdict == VerificationVerdict.AUTO_PASS
+                else OrderStatus.FAILED
+            )
+            async with connect(self._settings) as conn:
+                await append_audit(
+                    conn,
+                    actor=actor,
+                    event="panel_verification",
+                    order_uuid=order.client_order_uuid,
+                    details={"verdict": verdict.verdict.value, "reason": verdict.reason},
+                )
+                claimed = await claim_order_status(
+                    conn,
+                    order.client_order_uuid,
+                    target=final,
+                    allowed_from=(OrderStatus.VERIFYING,),
+                    raw_exchange_status="completed",
+                )
+                if not claimed:
+                    current = await get_order(conn, order.client_order_uuid)
+                    return current.status if current else order.status
+                await append_audit(
+                    conn,
+                    actor=actor,
+                    event=f"order_{final.value}",
+                    order_uuid=order.client_order_uuid,
+                )
+            return final
+
+        # Task-exchange branch (HIGH-5 fix).
+        async with connect(self._settings) as conn:
+            pending = await count_non_terminal_submissions_for_order(conn, order.client_order_uuid)
+        if pending > 0:
+            async with connect(self._settings) as conn:
+                await append_audit(
+                    conn,
+                    actor=actor,
+                    event="order_completion_pending",
+                    order_uuid=order.client_order_uuid,
+                    details={"pending_submissions": pending},
+                )
+            return OrderStatus.VERIFYING  # keep open until all submissions terminal
+
+        async with connect(self._settings) as conn:
+            claimed = await claim_order_status(
+                conn,
+                order.client_order_uuid,
+                target=OrderStatus.COMPLETED,
+                allowed_from=(OrderStatus.VERIFYING,),
+                raw_exchange_status="completed",
+            )
+            if not claimed:
+                current = await get_order(conn, order.client_order_uuid)
+                return current.status if current else order.status
+            await append_audit(
+                conn,
+                actor=actor,
+                event="order_completed",
+                order_uuid=order.client_order_uuid,
+            )
+        return OrderStatus.COMPLETED
+
+    # --- C2 money actions ----------------------------------------------------
+
+    async def accept_submission(self, submission_uuid: str, decided_by: str) -> bool:
+        """C2 pattern. Returns True iff this call ran the external action."""
+        return await self._decide_submission(
+            submission_uuid,
+            target_in_progress=SubmissionStatus.ACCEPTING,
+            target_terminal=SubmissionStatus.ACCEPTED,
+            action="accept",
+            decided_by=decided_by,
+            reason=None,
+        )
+
+    async def reject_submission(self, submission_uuid: str, reason: str, decided_by: str) -> bool:
+        """C2 pattern for rework. Returns True iff this call ran the external action."""
+        return await self._decide_submission(
+            submission_uuid,
+            target_in_progress=SubmissionStatus.REJECTING,
+            target_terminal=SubmissionStatus.REWORK_REQUESTED,
+            action="reject",
+            decided_by=decided_by,
+            reason=reason,
+        )
+
+    async def _decide_submission(
         self,
         submission_uuid: str,
-        actor: str,
-        reason: str = "Возвращено администратором на доработку",
-    ) -> dict[str, Any]:
-        """Reject a human-reviewed submission through the same C2 guard as auto-reject."""
-        if self._settings.dry_run:
-            return {
-                "submission_uuid": submission_uuid,
-                "status": "dry_run_blocked",
-                "reason": "DRY_RUN=true: external reject is disabled",
-            }
-        order, sub, adapter_or_error = await self._load_admin_decision_context(submission_uuid)
-        if isinstance(adapter_or_error, dict):
-            return adapter_or_error
-        adapter = adapter_or_error
-        result = VerificationResult(
-            verdict=VerificationVerdict.FAIL,
-            measured=0.0,
-            expected=float(order.spec.quantity),
-            reason=reason,
-            raw_evidence={"mode": "admin", "actor": actor},
-        )
-        decision = await self._reject_submission(order, adapter, sub, result, decided_by=actor)
-        await self._complete_order_if_all_submissions_terminal(order)
-        await self._audit(
-            "admin_reject",
-            order.client_order_uuid,
-            {"submission_uuid": submission_uuid, "actor": actor, "decision": decision},
-        )
-        return decision
+        *,
+        target_in_progress: SubmissionStatus,
+        target_terminal: SubmissionStatus,
+        action: str,
+        decided_by: str,
+        reason: str | None,
+    ) -> bool:
+        async with connect(self._settings) as conn:
+            sub = await get_submission(conn, submission_uuid)
+        if sub is None:
+            raise ValueError(f"submission {submission_uuid!r} not found")
+        async with connect(self._settings) as conn:
+            order = await get_order(conn, sub.order_uuid)
+        if order is None:
+            raise ValueError(
+                f"order {sub.order_uuid!r} not found for submission {submission_uuid!r}"
+            )
+        adapter = self.adapter_for(order.spec.exchange)
+        if not isinstance(adapter, TaskExchangeAdapter):
+            raise TypeError(f"{action} called for non-task-exchange adapter {adapter.name!r}")
+
+        # HIGH-3 fix: claim + action_log open in a SINGLE transaction.
+        action_uuid = str(uuid.uuid4())
+        async with connect(self._settings) as conn:
+            claimed = await claim_submission_and_open_action(
+                conn,
+                submission_uuid,
+                target=target_in_progress,
+                allowed_from=(
+                    SubmissionStatus.NEW,
+                    SubmissionStatus.VERIFYING,
+                    SubmissionStatus.AWAITING_ADMIN,
+                ),
+                action_uuid=action_uuid,
+                action=action,
+                order_uuid=sub.order_uuid,
+            )
+        if not claimed:
+            return False
+
+        # EXTERNAL CALL (outside any open DB transaction).
+        assert sub.external_submission_id is not None
+        assert order.external_order_id is not None
+        try:
+            if action == "accept":
+                await adapter.accept_submission(order.external_order_id, sub.external_submission_id)
+            else:
+                await adapter.reject_submission(
+                    order.external_order_id,
+                    sub.external_submission_id,
+                    reason or "",
+                )
+        except Exception as exc:
+            async with connect(self._settings) as conn:
+                # Force-set FAILED regardless of current status; this caller is the
+                # unique claimer and the action just errored.
+                cursor = await conn.execute(
+                    "UPDATE submissions SET status = ?, updated_at = ? WHERE submission_uuid = ?",
+                    (
+                        SubmissionStatus.FAILED.value,
+                        datetime.now(UTC).isoformat(timespec="seconds"),
+                        submission_uuid,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    # Submission row disappeared mid-action; extremely unlikely. Surface it.
+                    raise RuntimeError(
+                        f"_decide_submission: submission {submission_uuid!r} vanished"
+                    ) from exc
+                await conn.commit()
+                await complete_action_log(
+                    conn, action_uuid=action_uuid, state="failed", error=str(exc)
+                )
+                await append_audit(
+                    conn,
+                    actor=decided_by,
+                    event=f"submission_{action}_failed",
+                    submission_uuid=submission_uuid,
+                    order_uuid=sub.order_uuid,
+                    details={"error": str(exc)},
+                )
+            raise
+
+        # SUCCESS: terminal payment row (INSERT OR IGNORE), terminal submission
+        # status (conditional UPDATE: only the unique claimer expects ACCEPTING /
+        # REJECTING here), action_log -> succeeded, audit entry.
+        async with connect(self._settings) as conn:
+            await record_payment(
+                conn,
+                exchange=order.spec.exchange,
+                external_submission_id=sub.external_submission_id,
+                action=action,
+                submission_uuid=submission_uuid,
+                decided_by=decided_by,
+            )
+            terminal_claimed = await claim_submission_action(
+                conn,
+                submission_uuid,
+                target=target_terminal,
+                allowed_from=(target_in_progress,),
+            )
+            if not terminal_claimed:
+                # Shouldn't happen - we held the claim. Surface for audit.
+                raise RuntimeError(
+                    f"_decide_submission: failed to transition "
+                    f"{submission_uuid!r} {target_in_progress.value} -> "
+                    f"{target_terminal.value}"
+                )
+            await complete_action_log(conn, action_uuid=action_uuid, state="succeeded")
+            await append_audit(
+                conn,
+                actor=decided_by,
+                event=f"submission_{target_terminal.value}",
+                submission_uuid=submission_uuid,
+                order_uuid=sub.order_uuid,
+                details={"decided_by": decided_by, "reason": reason},
+            )
+        return True
+
+    # --- C1 startup reconciliation -------------------------------------------
 
     async def reconcile_creating(
         self,
         actor: str = "reconcile",
         min_age_seconds: int = 300,
     ) -> int:
-        """C1 startup reconciliation: move orphan CREATING orders to FAILED.
+        """Move ORPHAN CREATING orders to FAILED.
 
-        Day 3 audit (HIGH-4 fix): age-gated so we never race a live in-flight
-        `create_order`. A row created within `min_age_seconds` is left alone —
-        the most likely explanation is that another worker is still between the
-        `INSERT INTO orders` and `mark_order_active`. After the threshold, the
-        conservative choice is to mark the row FAILED + log an audit entry; a
-        human (or the per-adapter exchange-side lookup, future scope)
-        determines whether the order actually made it to the exchange.
+        Day 3 audit HIGH-4 fix: only act on rows older than `min_age_seconds`
+        (default 5 minutes) so we never race with an in-flight `create_order`
+        whose `mark_order_active` is still pending.
 
-        Returns the number of rows reconciled. Default `min_age_seconds=300`
-        (5 minutes) — production callers (`main.py` startup) use the default;
-        tests pass `0` to act on freshly-inserted fixture rows.
+        For a true crash-mid-placement (process killed between adapter call and
+        `mark_order_active`), the conservative choice remains: mark FAILED +
+        audit, let a human reconcile against the exchange dashboard. Per-adapter
+        exchange-side lookup is future scope.
+
+        Returns the number of rows reconciled.
         """
         cutoff_iso = (datetime.now(UTC) - timedelta(seconds=max(0, min_age_seconds))).isoformat(
             timespec="seconds"
@@ -214,642 +632,3 @@ class Orchestrator:
                     },
                 )
         return len(uuids)
-
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
-
-    async def _poll_one(self, order: Order) -> dict[str, Any]:
-        adapter = self._adapters.get(order.spec.exchange)
-        if adapter is None:
-            return {
-                "order_uuid": order.client_order_uuid,
-                "status": "error",
-                "error": f"no adapter for exchange {order.spec.exchange!r}",
-            }
-
-        caps = adapter.capabilities()
-        ext_order = order.external_order_id
-        if ext_order is None:
-            return {
-                "order_uuid": order.client_order_uuid,
-                "status": "error",
-                "error": "order has no external_order_id",
-            }
-
-        raw_status: str = "unknown"
-        if Capability.GET_ORDER_STATUS in caps:
-            raw_status = await adapter.get_order_status(ext_order)  # type: ignore[attr-defined]
-        else:
-            raw_status = "in_progress"
-        await self._audit(
-            "poll",
-            order.client_order_uuid,
-            {"raw_status": raw_status, "exchange": order.spec.exchange},
-        )
-
-        # Normalize status to our state machine
-        if raw_status == "completed":
-            if order.status != OrderStatus.VERIFYING:
-                await self._update_order_status(order.client_order_uuid, OrderStatus.VERIFYING)
-        elif raw_status == "failed":
-            await self._update_order_status(order.client_order_uuid, OrderStatus.FAILED)
-            return {
-                "order_uuid": order.client_order_uuid,
-                "status": "failed",
-                "reason": "exchange reported failed",
-            }
-        else:
-            # in_progress — keep ACTIVE if not already
-            if order.status != OrderStatus.ACTIVE:
-                await self._update_order_status(order.client_order_uuid, OrderStatus.ACTIVE)
-
-        # 2. For panel adapters (no submissions), verify at completed
-        if Capability.LIST_SUBMISSIONS not in caps:
-            if raw_status == "completed":
-                return await self._verify_and_decide_panel(order, adapter)
-            return {
-                "order_uuid": order.client_order_uuid,
-                "status": "in_progress",
-                "raw_status": raw_status,
-            }
-
-        # 3. Task-exchange path
-        if not isinstance(adapter, TaskExchangeAdapter):
-            return {
-                "order_uuid": order.client_order_uuid,
-                "status": "error",
-                "error": (
-                    f"adapter {order.spec.exchange} claims LIST_SUBMISSIONS "
-                    "but is not a TaskExchangeAdapter"
-                ),
-            }
-
-        result = await self._process_task_exchange(order, adapter)
-
-        # If exchange says completed and all submissions are terminal, mark order completed
-        if raw_status == "completed":
-            async with connect(self._settings) as conn:
-                all_subs = await get_submissions_for_order(conn, order.client_order_uuid)
-            terminal = {
-                SubmissionStatus.ACCEPTED,
-                SubmissionStatus.REWORK_REQUESTED,
-                SubmissionStatus.FAILED,
-            }
-            if all_subs and all(s.status in terminal for s in all_subs):
-                await self._update_order_status(order.client_order_uuid, OrderStatus.COMPLETED)
-                await self._audit(
-                    "order_completed",
-                    order.client_order_uuid,
-                    {"reason": "all submissions terminal"},
-                )
-                await self._record_report_row(order)
-                result["status"] = "completed"
-
-        return result
-
-    # ------------------------------------------------------------------
-    # Panel path
-    # ------------------------------------------------------------------
-
-    async def _verify_and_decide_panel(
-        self, order: Order, adapter: ExchangeAdapter
-    ) -> dict[str, Any]:
-        verifier = self._pick_verifier(order)
-        result = await verifier.verify(order)
-        await self._persist_verification(order.client_order_uuid, None, result)
-
-        if result.verdict == VerificationVerdict.AUTO_PASS:
-            # Panels are prepaid — no per-submission accept. Mark completed.
-            await self._update_order_status(order.client_order_uuid, OrderStatus.COMPLETED)
-            await self._record_report_row(order, actual_count=int(result.measured))
-            await self._audit(
-                "panel_completed",
-                order.client_order_uuid,
-                {"verdict": result.verdict.value, "measured": result.measured},
-            )
-            return {
-                "order_uuid": order.client_order_uuid,
-                "status": "completed",
-                "verdict": result.verdict.value,
-                "measured": result.measured,
-            }
-
-        if result.verdict == VerificationVerdict.FAIL:
-            # Panel orders are prepaid — cannot reject. Mark failed.
-            await self._update_order_status(order.client_order_uuid, OrderStatus.FAILED)
-            await self._record_report_row(order, actual_count=int(result.measured), status="failed")
-            await self._audit(
-                "panel_failed",
-                order.client_order_uuid,
-                {"verdict": result.verdict.value, "reason": result.reason},
-            )
-            return {
-                "order_uuid": order.client_order_uuid,
-                "status": "failed",
-                "verdict": result.verdict.value,
-                "reason": result.reason,
-            }
-
-        # needs_human_review
-        await self._audit(
-            "panel_needs_review",
-            order.client_order_uuid,
-            {"verdict": result.verdict.value, "reason": result.reason},
-        )
-        return {
-            "order_uuid": order.client_order_uuid,
-            "status": "needs_human_review",
-            "verdict": result.verdict.value,
-            "reason": result.reason,
-        }
-
-    # ------------------------------------------------------------------
-    # Task-exchange path
-    # ------------------------------------------------------------------
-
-    async def _process_task_exchange(
-        self, order: Order, adapter: TaskExchangeAdapter
-    ) -> dict[str, Any]:
-        external_id = order.external_order_id
-        assert external_id is not None
-
-        # Ingest new submissions from the exchange.
-        # Day 3 audit (CRITICAL-1 fix): race-safe via ensure_submission_persisted —
-        # INSERT OR IGNORE against the partial unique index, then re-fetch the
-        # canonical row. Two concurrent pollers converge on the same submission_uuid.
-        external_subs = await adapter.list_submissions(external_id)
-        newly_created: list[Submission] = []
-        for es in external_subs:
-            now = datetime.now(UTC)
-            candidate = Submission(
-                submission_uuid=str(uuid.uuid4()),
-                order_uuid=order.client_order_uuid,
-                external_submission_id=es.external_submission_id,
-                executor_hint=es.executor_hint,
-                status=SubmissionStatus.NEW,
-                evidence=es.evidence,
-                created_at=now,
-            )
-            async with connect(self._settings) as conn:
-                sub, inserted_now = await ensure_submission_persisted(conn, candidate)
-            if inserted_now:
-                newly_created.append(sub)
-                await self._audit(
-                    "submission_ingested",
-                    order.client_order_uuid,
-                    {
-                        "submission_uuid": sub.submission_uuid,
-                        "external_submission_id": es.external_submission_id,
-                    },
-                )
-
-        # Load all pending submissions for this order
-        async with connect(self._settings) as conn:
-            all_subs = await get_submissions_for_order(conn, order.client_order_uuid)
-        pending = [s for s in all_subs if s.status == SubmissionStatus.NEW]
-
-        decisions: list[dict[str, Any]] = []
-        for sub in pending:
-            decision = await self._verify_and_decide_submission(order, adapter, sub)
-            decisions.append(decision)
-
-        # If there are still unresolved submissions, order stays in_progress
-        # (the exchange will keep it in_progress until all are accepted/rejected)
-        return {
-            "order_uuid": order.client_order_uuid,
-            "status": "processed",
-            "new_submissions": len(newly_created),
-            "pending_submissions": len(pending),
-            "decisions": decisions,
-        }
-
-    async def _verify_and_decide_submission(
-        self,
-        order: Order,
-        adapter: TaskExchangeAdapter,
-        sub: Submission,
-    ) -> dict[str, Any]:
-        """Verify a single submission and decide accept/reject/human-review.
-
-        Day 3 audit (CRITICAL-2 fix): the NEW → VERIFYING transition is a
-        conditional UPDATE. A second concurrent poller seeing the same
-        SubmissionStatus.NEW row will lose the claim and skip — only one caller
-        runs the external verifier + accept/reject flow.
-        """
-        async with connect(self._settings) as conn:
-            claimed = await claim_submission_action(
-                conn,
-                sub.submission_uuid,
-                target=SubmissionStatus.VERIFYING,
-                allowed_from=(SubmissionStatus.NEW,),
-            )
-        if not claimed:
-            return {
-                "submission_uuid": sub.submission_uuid,
-                "decision": "skipped",
-                "reason": "concurrent worker already processing",
-            }
-
-        verifier = self._pick_verifier(order)
-        result = await verifier.verify(order, submission=sub)
-        await self._persist_verification(order.client_order_uuid, sub.submission_uuid, result)
-
-        if self._settings.dry_run and result.verdict in (
-            VerificationVerdict.AUTO_PASS,
-            VerificationVerdict.FAIL,
-        ):
-            async with connect(self._settings) as conn:
-                await claim_submission_action(
-                    conn,
-                    sub.submission_uuid,
-                    target=SubmissionStatus.AWAITING_ADMIN,
-                    allowed_from=(SubmissionStatus.VERIFYING,),
-                )
-            await self._audit(
-                "submission_dry_run_decision_blocked",
-                order.client_order_uuid,
-                {
-                    "submission_uuid": sub.submission_uuid,
-                    "external_submission_id": sub.external_submission_id,
-                    "would_have_verdict": result.verdict.value,
-                    "reason": "DRY_RUN=true: no external accept/reject",
-                },
-            )
-            return {
-                "submission_uuid": sub.submission_uuid,
-                "decision": "dry_run_blocked",
-                "would_have_verdict": result.verdict.value,
-                "reason": "DRY_RUN=true: no external accept/reject",
-            }
-
-        if result.verdict == VerificationVerdict.AUTO_PASS:
-            return await self._accept_submission(order, adapter, sub, result)
-
-        if result.verdict == VerificationVerdict.FAIL:
-            return await self._reject_submission(order, adapter, sub, result)
-
-        # needs_human_review: VERIFYING → AWAITING_ADMIN (conditional, CRITICAL-2).
-        async with connect(self._settings) as conn:
-            await claim_submission_action(
-                conn,
-                sub.submission_uuid,
-                target=SubmissionStatus.AWAITING_ADMIN,
-                allowed_from=(SubmissionStatus.VERIFYING,),
-            )
-        await self._audit(
-            "submission_needs_review",
-            order.client_order_uuid,
-            {
-                "submission_uuid": sub.submission_uuid,
-                "external_submission_id": sub.external_submission_id,
-                "reason": result.reason,
-            },
-        )
-        return {
-            "submission_uuid": sub.submission_uuid,
-            "decision": "needs_human_review",
-            "reason": result.reason,
-        }
-
-    async def _accept_submission(
-        self,
-        order: Order,
-        adapter: TaskExchangeAdapter,
-        sub: Submission,
-        result: VerificationResult,
-        *,
-        decided_by: str = "orchestrator",
-    ) -> dict[str, Any]:
-        """C2-safe accept: claim → check payments → call adapter → record.
-
-        Day 3 audit (HIGH-3 fix): the submission claim (→ ACCEPTING) and the
-        `action_log` open commit in a SINGLE transaction via
-        `claim_submission_and_open_action`. A losing concurrent caller — or one
-        that finds the row already terminal — returns `accept_skipped` without
-        making the external call.
-        """
-        ext_order = order.external_order_id
-        ext_sub = sub.external_submission_id
-        if ext_order is None or ext_sub is None:
-            return {
-                "submission_uuid": sub.submission_uuid,
-                "decision": "accept_skipped",
-                "reason": "missing external ids",
-            }
-        assert ext_order is not None and ext_sub is not None
-        action_uuid = str(uuid.uuid4())
-        async with connect(self._settings) as conn:
-            # 1. Atomic claim + action_log open. Allowed-from includes the
-            #    statuses an admin or earlier verifier could have left the row
-            #    in. A loser of the race returns False and we skip cleanly.
-            claimed = await claim_submission_and_open_action(
-                conn,
-                sub.submission_uuid,
-                target=SubmissionStatus.ACCEPTING,
-                allowed_from=(
-                    SubmissionStatus.NEW,
-                    SubmissionStatus.VERIFYING,
-                    SubmissionStatus.AWAITING_ADMIN,
-                ),
-                action_uuid=action_uuid,
-                action="accept",
-                order_uuid=order.client_order_uuid,
-            )
-            already = await payment_exists(conn, order.spec.exchange, ext_sub)
-        if not claimed:
-            await self._audit(
-                "accept_skipped",
-                order.client_order_uuid,
-                {
-                    "submission_uuid": sub.submission_uuid,
-                    "reason": "claim lost (concurrent worker or terminal status)",
-                },
-            )
-            return {
-                "submission_uuid": sub.submission_uuid,
-                "decision": "accept_skipped",
-                "reason": "claim lost",
-            }
-        if already:
-            # Healed-state path: payment row already exists from an earlier
-            # attempt that crashed AFTER recording payment but BEFORE moving
-            # submission to ACCEPTED. We hold the claim → finish the
-            # transition + close action_log. NO external call (already paid).
-            async with connect(self._settings) as conn:
-                await record_action_success(conn, action_uuid)
-                await update_submission_status(conn, sub.submission_uuid, SubmissionStatus.ACCEPTED)
-            await self._audit(
-                "accept_skipped",
-                order.client_order_uuid,
-                {
-                    "submission_uuid": sub.submission_uuid,
-                    "reason": "already paid (healed status → ACCEPTED)",
-                },
-            )
-            return {
-                "submission_uuid": sub.submission_uuid,
-                "decision": "accept_skipped",
-                "reason": "already paid",
-            }
-
-        # 3. External call (outside DB transaction)
-        try:
-            await adapter.accept_submission(ext_order, ext_sub)
-        except Exception as exc:
-            async with connect(self._settings) as conn:
-                await record_action_failure(conn, action_uuid, str(exc))
-            await self._audit(
-                "accept_failed",
-                order.client_order_uuid,
-                {
-                    "submission_uuid": sub.submission_uuid,
-                    "error": str(exc),
-                },
-            )
-            return {
-                "submission_uuid": sub.submission_uuid,
-                "decision": "accept_failed",
-                "error": str(exc),
-            }
-
-        # 4. Record terminal payment + update submission status
-        async with connect(self._settings) as conn:
-            await record_action_success(conn, action_uuid)
-            from db.database import insert_payment
-
-            await insert_payment(
-                conn,
-                exchange=order.spec.exchange,
-                external_submission_id=ext_sub,
-                action="accept",
-                submission_uuid=sub.submission_uuid,
-                decided_by=decided_by,
-            )
-            await update_submission_status(conn, sub.submission_uuid, SubmissionStatus.ACCEPTED)
-
-        await self._audit(
-            "submission_accepted",
-            order.client_order_uuid,
-            {
-                "submission_uuid": sub.submission_uuid,
-                "external_submission_id": sub.external_submission_id,
-                "measured": result.measured,
-            },
-        )
-        return {
-            "submission_uuid": sub.submission_uuid,
-            "decision": "accepted",
-            "measured": result.measured,
-        }
-
-    async def _reject_submission(
-        self,
-        order: Order,
-        adapter: TaskExchangeAdapter,
-        sub: Submission,
-        result: VerificationResult,
-        *,
-        decided_by: str = "orchestrator",
-    ) -> dict[str, Any]:
-        """A6: auto-reject for fail verdict (safe, no money spent)."""
-        ext_order = order.external_order_id
-        ext_sub = sub.external_submission_id
-        if ext_order is None or ext_sub is None:
-            return {
-                "submission_uuid": sub.submission_uuid,
-                "decision": "reject_skipped",
-                "reason": "missing external ids",
-            }
-        assert ext_order is not None and ext_sub is not None
-        action_uuid = str(uuid.uuid4())
-        async with connect(self._settings) as conn:
-            claimed = await claim_submission_and_open_action(
-                conn,
-                sub.submission_uuid,
-                target=SubmissionStatus.REJECTING,
-                allowed_from=(
-                    SubmissionStatus.NEW,
-                    SubmissionStatus.VERIFYING,
-                    SubmissionStatus.AWAITING_ADMIN,
-                ),
-                action_uuid=action_uuid,
-                action="reject",
-                order_uuid=order.client_order_uuid,
-            )
-            already = await payment_exists(conn, order.spec.exchange, ext_sub)
-        if not claimed:
-            return {
-                "submission_uuid": sub.submission_uuid,
-                "decision": "reject_skipped",
-                "reason": "claim lost",
-            }
-        if already:
-            # Healed-state path: payment row already exists (from an earlier
-            # crashed attempt). Close action_log and move submission to its
-            # terminal state. No external call.
-            async with connect(self._settings) as conn:
-                await record_action_success(conn, action_uuid)
-                await update_submission_status(
-                    conn, sub.submission_uuid, SubmissionStatus.REWORK_REQUESTED
-                )
-            return {
-                "submission_uuid": sub.submission_uuid,
-                "decision": "reject_skipped",
-                "reason": "already terminal (healed status → REWORK_REQUESTED)",
-            }
-
-        try:
-            await adapter.reject_submission(ext_order, ext_sub, reason=result.reason)
-        except Exception as exc:
-            async with connect(self._settings) as conn:
-                await record_action_failure(conn, action_uuid, str(exc))
-            return {
-                "submission_uuid": sub.submission_uuid,
-                "decision": "reject_failed",
-                "error": str(exc),
-            }
-
-        async with connect(self._settings) as conn:
-            await record_action_success(conn, action_uuid)
-            from db.database import insert_payment
-
-            await insert_payment(
-                conn,
-                exchange=order.spec.exchange,
-                external_submission_id=ext_sub,
-                action="reject",
-                submission_uuid=sub.submission_uuid,
-                decided_by=decided_by,
-            )
-            await update_submission_status(
-                conn, sub.submission_uuid, SubmissionStatus.REWORK_REQUESTED
-            )
-
-        await self._audit(
-            "submission_rejected",
-            order.client_order_uuid,
-            {
-                "submission_uuid": sub.submission_uuid,
-                "external_submission_id": sub.external_submission_id,
-                "reason": result.reason,
-            },
-        )
-        return {
-            "submission_uuid": sub.submission_uuid,
-            "decision": "rejected",
-            "reason": result.reason,
-        }
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _pick_verifier(self, order: Order):
-        if order.spec.scenario == Scenario.SOCIAL_TRAFFIC:
-            return self._traffic_verifier
-        return self._activity_verifier
-
-    async def _load_admin_decision_context(
-        self, submission_uuid: str
-    ) -> tuple[Order, Submission, TaskExchangeAdapter] | tuple[None, None, dict[str, Any]]:
-        async with connect(self._settings) as conn:
-            sub = await get_submission(conn, submission_uuid)
-            if sub is None:
-                return None, None, {"submission_uuid": submission_uuid, "status": "not_found"}
-            order = await get_order(conn, sub.order_uuid)
-            if order is None:
-                return (
-                    None,
-                    None,
-                    {
-                        "submission_uuid": submission_uuid,
-                        "status": "error",
-                        "error": "parent order not found",
-                    },
-                )
-
-        adapter = self._adapters.get(order.spec.exchange)
-        if not isinstance(adapter, TaskExchangeAdapter):
-            return (
-                None,
-                None,
-                {
-                    "submission_uuid": submission_uuid,
-                    "status": "error",
-                    "error": f"no task-exchange adapter for {order.spec.exchange!r}",
-                },
-            )
-        return order, sub, adapter
-
-    async def _record_report_row(
-        self,
-        order: Order,
-        *,
-        actual_count: int | None = None,
-        status: str | None = None,
-    ) -> None:
-        if order.spec.scenario != Scenario.SOCIAL_TRAFFIC or order.spec.source_platform is None:
-            return
-
-        if actual_count is None:
-            async with connect(self._settings) as conn:
-                subs = await get_submissions_for_order(conn, order.client_order_uuid)
-            actual_count = sum(1 for sub in subs if sub.status == SubmissionStatus.ACCEPTED)
-
-        week = datetime.now(UTC).strftime("%G-W%V")
-        async with connect(self._settings) as conn:
-            await insert_report_row(
-                conn,
-                week=week,
-                source_platform=order.spec.source_platform.value,
-                exchange=order.spec.exchange,
-                ordered_count=order.spec.quantity,
-                actual_count=actual_count,
-                cost=order.cost_actual,
-                status=status or OrderStatus.COMPLETED.value,
-            )
-
-    async def _complete_order_if_all_submissions_terminal(self, order: Order) -> None:
-        async with connect(self._settings) as conn:
-            subs = await get_submissions_for_order(conn, order.client_order_uuid)
-            stored = await get_order(conn, order.client_order_uuid)
-        if stored is None or stored.status in {
-            OrderStatus.COMPLETED,
-            OrderStatus.FAILED,
-            OrderStatus.CANCELLED,
-        }:
-            return
-        terminal = {
-            SubmissionStatus.ACCEPTED,
-            SubmissionStatus.REWORK_REQUESTED,
-            SubmissionStatus.FAILED,
-        }
-        if subs and all(sub.status in terminal for sub in subs):
-            await self._update_order_status(order.client_order_uuid, OrderStatus.COMPLETED)
-            await self._record_report_row(order)
-
-    async def _update_order_status(self, order_uuid: str, status: OrderStatus) -> None:
-        async with connect(self._settings) as conn:
-            await update_order_status(conn, order_uuid, status)
-
-    async def _update_submission_status(
-        self, submission_uuid: str, status: SubmissionStatus
-    ) -> None:
-        async with connect(self._settings) as conn:
-            await update_submission_status(conn, submission_uuid, status)
-
-    async def _persist_verification(
-        self,
-        order_uuid: str,
-        submission_uuid: str | None,
-        result: VerificationResult,
-    ) -> None:
-        async with connect(self._settings) as conn:
-            await insert_verification(conn, order_uuid, submission_uuid, result)
-
-    async def _audit(self, event: str, order_uuid: str, details: dict[str, Any]) -> None:
-        async with connect(self._settings) as conn:
-            await append_audit(
-                conn, actor="orchestrator", event=event, order_uuid=order_uuid, details=details
-            )

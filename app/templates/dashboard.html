@@ -1,0 +1,984 @@
+<!doctype html>
+<html lang="ru" data-theme="corporate">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SMM-агрегатор · панель управления</title>
+  <link rel="icon" href="data:," />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://cdn.jsdelivr.net/npm/daisyui@4.12.10/dist/full.min.css" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --accent-grad: linear-gradient(135deg, #2563eb 0%, #7c3aed 100%);
+    }
+    .agent-feed, .chat-panel {
+      overflow-y: auto;
+      scroll-behavior: smooth;
+    }
+    .agent-feed::-webkit-scrollbar, .chat-panel::-webkit-scrollbar { width: 6px; }
+    .agent-feed::-webkit-scrollbar-thumb, .chat-panel::-webkit-scrollbar-thumb {
+      background: hsl(var(--bc) / 0.25);
+      border-radius: 999px;
+    }
+    .agent-feed { max-height: 560px; }
+    .chat-panel { height: 430px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .pulse-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #16a34a;
+      box-shadow: 0 0 6px #16a34a;
+      animation: pulse 1.6s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.35; transform: scale(1.35); }
+    }
+    .brand-mark {
+      width: 36px; height: 36px; border-radius: 10px;
+      background: var(--accent-grad);
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 700; color: white; font-size: 18px;
+      box-shadow: 0 2px 12px rgba(124, 58, 237, 0.25);
+    }
+    .card-section {
+      transition: box-shadow .15s ease;
+    }
+    .card-section:hover {
+      box-shadow: 0 4px 16px rgba(0,0,0,0.07);
+    }
+    .exchange-row {
+      transition: background .15s ease;
+    }
+    .exchange-row:hover { background: hsl(var(--b2)); }
+    .tool-badge {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 600;
+      background: hsl(var(--p) / 0.12);
+      color: hsl(var(--p));
+    }
+    summary { list-style: none; }
+    summary::-webkit-details-marker { display: none; }
+  </style>
+</head>
+<body class="min-h-screen bg-base-200 text-base-content">
+
+<!-- ╭─────────────────────────── HEADER ───────────────────────────╮ -->
+<div class="navbar bg-base-100 shadow-sm sticky top-0 z-30 border-b border-base-300">
+  <div class="flex-1">
+    <div class="flex items-center gap-3 px-4">
+      <div class="brand-mark">S</div>
+      <div>
+        <div class="text-lg font-semibold leading-tight">SMM-агрегатор</div>
+        <div class="text-xs opacity-70">LLM-агент-оркестратор · {{ adapters | length }} бирж подключено</div>
+      </div>
+    </div>
+  </div>
+  <div class="flex-none gap-3 pr-4">
+    <div class="hidden sm:flex items-center gap-2 text-xs opacity-70">
+      <div id="wsDot" class="pulse-dot"></div>
+      <span id="wsLabel">онлайн</span>
+    </div>
+    <div class="stats stats-horizontal bg-base-200 hidden md:flex">
+      <div class="stat py-2 px-4">
+        <div class="stat-title text-xs">Общий баланс</div>
+        <div class="stat-value text-2xl" id="totalBalance">—</div>
+        <div class="stat-desc text-xs">по всем биржам</div>
+      </div>
+    </div>
+    <button class="btn btn-sm btn-ghost" onclick="refreshAll()" title="Обновить всё">↻</button>
+  </div>
+</div>
+
+<!-- ╭─────────────────────────── MAIN GRID ───────────────────────────╮ -->
+<main class="p-4 grid grid-cols-1 lg:grid-cols-12 gap-4 max-w-[1800px] mx-auto">
+
+  <!-- Балансы -->
+  <section class="card card-section bg-base-100 shadow-sm lg:col-span-3">
+    <div class="card-body p-4">
+      <div class="flex justify-between items-center gap-2">
+        <h2 class="card-title text-base flex items-center gap-2">💰 Балансы</h2>
+        <button class="btn btn-xs btn-outline" onclick="refreshBalances(true)" title="Сверить с биржами">обновить</button>
+      </div>
+      <div id="balancesBox" class="mt-2 space-y-2">
+        <div class="text-sm opacity-60">загружаем...</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Чат с агентом -->
+  <section class="card card-section bg-base-100 shadow-sm lg:col-span-5 lg:row-span-2">
+    <div class="card-body p-4 flex flex-col gap-3">
+      <div class="flex justify-between items-center gap-2">
+        <h2 class="card-title text-base flex items-center gap-2">🤖 Чат с агентом</h2>
+        <div class="flex items-center gap-2 text-xs opacity-70">
+          <span>сессия:</span>
+          <input id="chatSession" class="input input-xs input-bordered w-32 mono" value="dashboard" />
+        </div>
+      </div>
+      <div id="chatBox" class="chat-panel rounded bg-base-200 p-3">
+        <div class="text-sm opacity-60">Напиши боту цель — он сам подберёт биржу и разместит заказ.</div>
+      </div>
+      <form id="chatForm" class="space-y-2">
+        <textarea
+          id="chatInput"
+          class="textarea textarea-bordered w-full min-h-24"
+          maxlength="4000"
+          placeholder="Например: «накрути 50 лайков на https://youtu.be/...»"
+          required
+        ></textarea>
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="flex flex-wrap gap-2">
+            <button type="button" class="btn btn-xs btn-ghost quickPrompt"
+              data-prompt="Покажи текущие балансы по всем биржам. Ничего не размещай.">Балансы</button>
+            <button type="button" class="btn btn-xs btn-ghost quickPrompt"
+              data-prompt="Кратко перечисли активные заказы и что по ним ожидается.">Активные заказы</button>
+            <button type="button" class="btn btn-xs btn-ghost quickPrompt"
+              data-prompt="Подбери котировки для 100 лайков YouTube без размещения заказа.">Цены YT 100</button>
+          </div>
+          <button id="chatSend" class="btn btn-sm btn-primary" type="submit">Отправить</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <!-- Лента действий агента -->
+  <section class="card card-section bg-base-100 shadow-sm lg:col-span-4 lg:row-span-2">
+    <div class="card-body p-4 flex flex-col">
+      <div class="flex justify-between items-center gap-2">
+        <h2 class="card-title text-base flex items-center gap-2">📡 Действия агента</h2>
+        <span class="badge badge-success badge-sm gap-1"><div class="pulse-dot"></div> live</span>
+      </div>
+      <div id="feedBox" class="agent-feed mt-2 space-y-1 mono">
+        <div class="opacity-60 text-xs">подключаемся к потоку событий...</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Котировки -->
+  <section class="card card-section bg-base-100 shadow-sm lg:col-span-3">
+    <div class="card-body p-4">
+      <h2 class="card-title text-base flex items-center gap-2">💸 Котировки</h2>
+      <form id="quoteForm" class="mt-2 grid grid-cols-2 gap-2">
+        <select id="quoteMetric" class="select select-bordered select-sm">
+          <option value="likes">Лайки</option>
+          <option value="views">Просмотры</option>
+          <option value="subscribes">Подписчики</option>
+          <option value="comments">Комментарии</option>
+          <option value="shares">Репосты</option>
+          <option value="traffic">Трафик</option>
+        </select>
+        <select id="quotePlatform" class="select select-bordered select-sm" title="Не-YouTube платформы заказываются через smmcode, верификация — ручная (через админа в дашборде)">
+          <option value="youtube">YouTube ✓ авто-верификация</option>
+          <option value="vk">ВКонтакте · ручная верификация</option>
+          <option value="telegram">Telegram · ручная верификация</option>
+          <option value="x">X (Twitter) · ручная верификация</option>
+          <option value="dzen">Дзен · ручная верификация</option>
+          <option value="pinterest">Pinterest · ручная верификация</option>
+        </select>
+        <input id="quoteQuantity" class="input input-bordered input-sm" type="number" min="1" value="100" />
+        <button id="quoteButton" class="btn btn-sm btn-secondary" type="submit">Рассчитать</button>
+        <input id="quoteTarget" class="input input-bordered input-sm col-span-2" placeholder="ссылка на пост / видео / профиль" />
+      </form>
+      <div id="quoteResult" class="mt-3 space-y-2 text-sm">
+        <div class="opacity-60">Введи параметры и жми «Рассчитать».</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Заказы -->
+  <section class="card card-section bg-base-100 shadow-sm lg:col-span-8">
+    <div class="card-body p-4">
+      <div class="flex flex-wrap justify-between items-center gap-2">
+        <h2 class="card-title text-base flex items-center gap-2">📋 Заказы</h2>
+        <div class="flex flex-wrap gap-2 text-xs" id="ordersSummary"></div>
+      </div>
+      <div class="overflow-x-auto mt-2">
+        <table class="table table-xs">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Биржа</th>
+              <th>Платформа</th>
+              <th>Цель</th>
+              <th>Кол-во</th>
+              <th>Цена</th>
+              <th>Статус</th>
+              <th>Возраст</th>
+            </tr>
+          </thead>
+          <tbody id="ordersBody">
+            <tr><td colspan="8" class="opacity-60 text-center">загружаем...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- Запросы пополнения -->
+  <section class="card card-section bg-base-100 shadow-sm lg:col-span-4">
+    <div class="card-body p-4">
+      <h2 class="card-title text-base flex items-center gap-2">⏳ Ждут пополнения</h2>
+      <div id="topupsBox" class="mt-2 space-y-2">
+        <div class="text-sm opacity-60">нет запросов на пополнение</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Расходы -->
+  <section class="card card-section bg-base-100 shadow-sm lg:col-span-4">
+    <div class="card-body p-4">
+      <h2 class="card-title text-base flex items-center gap-2">📊 Расходы по биржам</h2>
+      <canvas id="spendChart" height="150"></canvas>
+    </div>
+  </section>
+
+  <!-- Операционная сводка -->
+  <section class="card card-section bg-base-100 shadow-sm lg:col-span-8">
+    <div class="card-body p-4">
+      <h2 class="card-title text-base flex items-center gap-2">📈 Сводка по операциям</h2>
+      <div id="opsSummary" class="stats stats-vertical md:stats-horizontal bg-base-200 mt-2"></div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="text-center text-xs opacity-50 py-6">
+  SMM-агрегатор · v4 · LLM-агент на kimi-k2.6 через Ollama Cloud
+</footer>
+
+<!-- модалка деталей заказа -->
+<dialog id="orderDetailDlg" class="modal">
+  <div class="modal-box max-w-3xl">
+    <div class="flex justify-between items-center mb-2">
+      <h3 class="font-bold text-lg">📋 Детали заказа</h3>
+      <form method="dialog"><button class="btn btn-sm btn-ghost">✕</button></form>
+    </div>
+    <div id="orderDetailBody"></div>
+  </div>
+  <form method="dialog" class="modal-backdrop"><button>close</button></form>
+</dialog>
+
+<!-- ╭─────────────────────────── SCRIPTS ───────────────────────────╮ -->
+<script>
+
+// ───────── форматирование ─────────
+function fmtMoney(x, cur='RUB') {
+  if (x === null || x === undefined || Number.isNaN(Number(x))) return '—';
+  const value = Number(x).toFixed(2);
+  return cur === 'RUB' ? `${value} ₽` : `${value} ${cur || ''}`.trim();
+}
+function fmtAge(iso) {
+  if (!iso) return '—';
+  const t = new Date(iso);
+  if (Number.isNaN(t.getTime())) return '—';
+  const sec = Math.max(0, Math.floor((Date.now() - t.getTime()) / 1000));
+  if (sec < 60) return sec + ' с';
+  if (sec < 3600) return Math.floor(sec / 60) + ' мин';
+  if (sec < 86400) return Math.floor(sec / 3600) + ' ч';
+  return Math.floor(sec / 86400) + ' дн';
+}
+function shortUuid(u) {
+  return u ? u.slice(0, 8) + '…' : '—';
+}
+function escapeHTML(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+// статус заказа → русская подпись + цвет бейджа
+const STATUS_LABEL = {
+  draft:     ['Черновик',  'badge-ghost'],
+  creating:  ['Размещение','badge-warning'],
+  active:    ['В работе',  'badge-info'],
+  verifying: ['Проверка',  'badge-warning'],
+  completed: ['Готово',    'badge-success'],
+  failed:    ['Ошибка',    'badge-error'],
+  cancelled: ['Отменён',   'badge-ghost'],
+};
+function statusBadge(status) {
+  const [label, color] = STATUS_LABEL[status] || [status, 'badge-ghost'];
+  return `<span class="badge badge-sm ${color}">${escapeHTML(label)}</span>`;
+}
+// человекочитаемое имя биржи
+const EXCHANGE_LABEL = {
+  smmcode: 'smmcode.shop',
+  prskill: 'prskill.ru',
+  unu:     'unu.im',
+  advego:  'advego.com',
+  ipgold:  'ipgold.ru',
+};
+function exchangeLabel(name) {
+  return EXCHANGE_LABEL[name] || name;
+}
+// платформы
+const PLATFORM_LABEL = {
+  youtube:   'YouTube',
+  vk:        'ВКонтакте',
+  telegram:  'Telegram',
+  x:         'X',
+  dzen:      'Дзен',
+  pinterest: 'Pinterest',
+};
+// метрики
+const METRIC_LABEL = {
+  likes:      'лайки',
+  views:      'просмотры',
+  subscribes: 'подписчики',
+  comments:   'комментарии',
+  shares:     'репосты',
+  traffic:    'трафик',
+};
+// инструменты агента — для красивых ярлыков в ленте
+const TOOL_LABEL = {
+  get_quote:          'Котировки',
+  get_balances:       'Балансы',
+  get_topup_info:     'Пополнение',
+  capture_snapshot:   'Снэпшот',
+  place_order:        'Размещение заказа',
+  check_order_status: 'Статус заказа',
+  check_delta:        'Проверка дельты',
+  report:             'Отчёт пользователю',
+};
+
+async function postJSON(url, payload) {
+  const r = await fetch(url, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) {
+    let detail = await r.text();
+    try {
+      const data = JSON.parse(detail);
+      detail = data.detail || detail;
+    } catch (_) {}
+    throw new Error(detail || r.status);
+  }
+  return await r.json();
+}
+
+// ───────── балансы ─────────
+async function refreshBalances(force=false) {
+  try {
+    const suffix = force ? '?force_refresh=true' : '';
+    const r = await fetch('/api/state/balances' + suffix, { credentials: 'include' });
+    if (!r.ok) throw new Error(r.status);
+    const data = await r.json();
+    document.getElementById('totalBalance').textContent = fmtMoney(data.total, data.currency);
+    const box = document.getElementById('balancesBox');
+    box.innerHTML = '';
+    for (const b of data.balances) {
+      const row = document.createElement('div');
+      row.className = 'exchange-row flex justify-between items-center gap-2 p-2 bg-base-200 rounded';
+      const noApiMark = b.no_api
+        ? '<span class="badge badge-ghost badge-xs ml-1" title="у биржи нет публичного API для баланса — смотрите в ЛК биржи">нет API</span>'
+        : '';
+      const staleMark = (b.stale && !b.no_api)
+        ? '<span class="badge badge-warning badge-xs ml-1" title="данные устарели — биржа не ответила, показано последнее известное значение">устарел</span>'
+        : '';
+      const errMark = b.error
+        ? `<span class="badge badge-error badge-xs ml-1" title="${escapeHTML(b.error)}">ошибка</span>`
+        : '';
+      const minLine = b.min_amount
+        ? ` · мин. пополнение ${fmtMoney(b.min_amount, b.currency)}`
+        : '';
+      const amountCell = b.no_api
+        ? '<div class="font-mono text-sm opacity-50">— только в ЛК</div>'
+        : `<div class="font-mono text-base">${fmtMoney(b.amount, b.currency)}</div>`;
+      row.innerHTML = `
+        <div>
+          <div class="font-semibold text-sm">${escapeHTML(exchangeLabel(b.exchange))}${noApiMark}${staleMark}${errMark}</div>
+          <div class="text-xs opacity-60">${b.no_api ? 'API не отдаёт балансы' : 'обновлено ' + fmtAge(b.fetched_at) + ' назад'}${minLine}</div>
+        </div>
+        <div class="text-right">
+          ${amountCell}
+          ${b.topup_url ? `<a href="${escapeHTML(b.topup_url)}" target="_blank" class="btn btn-xs btn-outline mt-1">Пополнить</a>` : ''}
+        </div>`;
+      box.appendChild(row);
+    }
+  } catch (e) {
+    console.error('balances:', e);
+  }
+}
+
+// ───────── заказы ─────────
+let _lastOrders = [];
+async function refreshOrders() {
+  try {
+    const r = await fetch('/api/state/orders', { credentials: 'include' });
+    if (!r.ok) throw new Error(r.status);
+    const data = await r.json();
+    _lastOrders = data.orders;
+    renderOrders(data.orders);
+    renderSummaries(data.orders);
+    updateSpendChart();
+  } catch (e) {
+    console.error('orders:', e);
+  }
+}
+function renderOrders(orders) {
+  const tbody = document.getElementById('ordersBody');
+  if (!orders.length) {
+    tbody.innerHTML = '<tr><td colspan="8" class="opacity-60 text-center py-6">заказов пока нет — напиши боту, чтобы создать первый</td></tr>';
+    return;
+  }
+  tbody.innerHTML = '';
+  for (const o of orders) {
+    const row = document.createElement('tr');
+    row.className = 'cursor-pointer hover:bg-base-200';
+    row.dataset.uuid = o.order_uuid;
+    const platform = PLATFORM_LABEL[o.platform] || (o.platform || '—');
+    const costCell = o.cost_actual !== null
+      ? `<span class="font-mono">${fmtMoney(o.cost_actual)}</span>`
+      : `<span class="font-mono opacity-70">${fmtMoney(o.max_cost)}</span> <span class="opacity-50 text-xs">лимит</span>`;
+    row.innerHTML = `
+      <td class="mono" title="${escapeHTML(o.order_uuid)}">${shortUuid(o.order_uuid)}</td>
+      <td>${escapeHTML(exchangeLabel(o.exchange))}</td>
+      <td>${escapeHTML(platform)}</td>
+      <td class="truncate max-w-[320px]" title="${escapeHTML(o.target)}">${escapeHTML(o.target).slice(0, 70)}</td>
+      <td>${escapeHTML(o.quantity)}</td>
+      <td>${costCell}</td>
+      <td>${statusBadge(o.status)}</td>
+      <td class="opacity-70">${fmtAge(o.created_at)}</td>`;
+    row.addEventListener('click', () => openOrderDetail(o.order_uuid));
+    tbody.appendChild(row);
+  }
+}
+
+// ───────── drill-down: детали заказа ─────────
+async function openOrderDetail(uuid) {
+  const dlg = document.getElementById('orderDetailDlg');
+  const body = document.getElementById('orderDetailBody');
+  body.innerHTML = '<div class="opacity-60 p-4">Загружаем детали...</div>';
+  dlg.showModal();
+  try {
+    const d = await (await fetch(`/api/state/orders/${encodeURIComponent(uuid)}`, { credentials: 'include' })).json();
+    if (d.detail) throw new Error(d.detail);
+    body.innerHTML = renderOrderDetail(d);
+  } catch (err) {
+    body.innerHTML = `<div class="alert alert-error">${escapeHTML(err.message || 'ошибка')}</div>`;
+  }
+}
+function renderOrderDetail(d) {
+  const o = d.order;
+  const audit = d.audit_log || [];
+  const verif = d.verifications || [];
+  const subs = d.submissions || [];
+  const evs = d.events || [];
+  const failedEv = evs.find((e) => e.kind === 'place_order_failed');
+  const failedBox = failedEv
+    ? `<div class="alert alert-error mb-3"><div><div class="font-semibold">Не удалось разместить заказ</div><div class="text-xs mt-1 whitespace-pre-wrap break-all">${escapeHTML(JSON.stringify(failedEv.payload, null, 2))}</div></div></div>`
+    : '';
+  const verifBox = verif.length
+    ? verif.map((v) => `
+        <div class="p-2 bg-base-200 rounded mb-2">
+          <div class="flex justify-between"><span class="font-semibold">${escapeHTML(v.verdict)}</span><span class="opacity-60 text-xs">${escapeHTML(v.created_at)}</span></div>
+          <div class="text-xs opacity-80 mt-1">${escapeHTML(v.reason || '')}</div>
+          <div class="text-xs opacity-60 mt-1">измерено: ${escapeHTML(v.measured ?? '—')} · ожидалось: ${escapeHTML(v.expected ?? '—')}</div>
+        </div>`).join('')
+    : '<div class="opacity-60 text-sm">проверок нет</div>';
+  const subBox = subs.length
+    ? subs.map((s) => `
+        <div class="p-2 bg-base-200 rounded mb-2">
+          <div class="flex justify-between"><span class="font-mono text-xs">${escapeHTML(s.external_submission_id || '—')}</span><span class="badge badge-sm">${escapeHTML(s.status)}</span></div>
+          <div class="text-xs opacity-70 mt-1">исполнитель: ${escapeHTML(s.executor_hint || '—')}</div>
+        </div>`).join('')
+    : '<div class="opacity-60 text-sm">сабмишенов нет</div>';
+  const auditBox = audit.length
+    ? audit.map((a) => `
+        <div class="text-xs border-l-2 border-base-300 pl-2 py-1 mb-1">
+          <div class="flex justify-between"><span class="font-semibold">${escapeHTML(a.event)}</span><span class="opacity-60">${escapeHTML(a.occurred_at)}</span></div>
+          <div class="opacity-70">${escapeHTML(a.actor)}${a.details ? ' · ' + escapeHTML(JSON.stringify(a.details).slice(0, 200)) : ''}</div>
+        </div>`).join('')
+    : '<div class="opacity-60 text-sm">audit log пуст</div>';
+  const adminBox = (o.status === 'verifying')
+    ? `<div class="alert alert-warning mb-3 flex flex-col sm:flex-row items-start sm:items-center gap-3">
+         <div class="flex-1">
+           <div class="font-semibold">⚠ На проверке — нужно ваше решение</div>
+           <div class="text-xs opacity-80">Биржа сказала «выполнено», но автоматический верификатор не уверен в дельте. Подтвердите вручную:</div>
+         </div>
+         <div class="flex gap-2">
+           <button class="btn btn-sm btn-success adminAcceptBtn" data-uuid="${escapeHTML(o.order_uuid)}">✅ Принять</button>
+           <button class="btn btn-sm btn-error adminRejectBtn" data-uuid="${escapeHTML(o.order_uuid)}">❌ Вернуть</button>
+         </div>
+       </div>`
+    : '';
+  return `
+    ${failedBox}
+    ${adminBox}
+    <div class="grid grid-cols-2 gap-3 text-sm mb-3">
+      <div><div class="opacity-60 text-xs">UUID</div><div class="mono text-xs break-all">${escapeHTML(o.order_uuid)}</div></div>
+      <div><div class="opacity-60 text-xs">External ID</div><div class="mono">${escapeHTML(o.external_order_id || '—')}</div></div>
+      <div><div class="opacity-60 text-xs">Биржа · сценарий</div><div>${escapeHTML(exchangeLabel(o.exchange))} · ${escapeHTML(o.scenario)}</div></div>
+      <div><div class="opacity-60 text-xs">Статус</div><div>${statusBadge(o.status)}</div></div>
+      <div><div class="opacity-60 text-xs">Количество</div><div>${escapeHTML(o.quantity)}</div></div>
+      <div><div class="opacity-60 text-xs">Цена · лимит</div><div>${fmtMoney(o.cost_actual)} / ${fmtMoney(o.max_cost)}</div></div>
+      <div class="col-span-2"><div class="opacity-60 text-xs">Цель</div><div class="break-all">${escapeHTML(o.target)}</div></div>
+    </div>
+    <div class="divider my-2 text-xs">Проверки (${verif.length})</div>
+    ${verifBox}
+    <div class="divider my-2 text-xs">Сабмишены (${subs.length})</div>
+    ${subBox}
+    <div class="divider my-2 text-xs">Audit log (${audit.length})</div>
+    <div class="max-h-64 overflow-y-auto">${auditBox}</div>`;
+}
+
+// Wire admin Accept/Reject buttons inside the drill-down modal. Delegated to
+// document level so re-renders don't lose handlers.
+document.addEventListener('click', async (ev) => {
+  const acceptBtn = ev.target.closest('.adminAcceptBtn');
+  const rejectBtn = ev.target.closest('.adminRejectBtn');
+  if (!acceptBtn && !rejectBtn) return;
+  const isAccept = !!acceptBtn;
+  const uuid = (acceptBtn || rejectBtn).dataset.uuid;
+  if (!uuid) return;
+  const action = isAccept ? 'admin_accept' : 'admin_reject';
+  const reason = isAccept
+    ? 'manual accept from dashboard'
+    : (prompt('Причина возврата (опционально):') || 'manual reject from dashboard');
+  (acceptBtn || rejectBtn).disabled = true;
+  try {
+    await postJSON(`/api/orders/${encodeURIComponent(uuid)}/${action}`, { reason });
+    await openOrderDetail(uuid);  // re-render modal with new state
+    await refreshOrders();
+  } catch (err) {
+    alert(`Не удалось: ${err.message}`);
+    (acceptBtn || rejectBtn).disabled = false;
+  }
+});
+function renderSummaries(orders) {
+  const byStatus = orders.reduce((acc, o) => {
+    acc[o.status] = (acc[o.status] || 0) + 1;
+    return acc;
+  }, {});
+  const summary = document.getElementById('ordersSummary');
+  const entries = Object.entries(byStatus);
+  summary.innerHTML = entries.length
+    ? entries.map(([s, c]) => {
+        const [label, color] = STATUS_LABEL[s] || [s, 'badge-ghost'];
+        return `<span class="badge ${color} badge-outline">${escapeHTML(label)}: ${c}</span>`;
+      }).join('')
+    : '<span class="badge badge-outline">заказов пока нет</span>';
+
+  const spent = orders.reduce((sum, o) => sum + Number(o.cost_actual || 0), 0);
+  const active = byStatus.active || 0;
+  const verifying = byStatus.verifying || 0;
+  const failed = byStatus.failed || 0;
+  const completed = byStatus.completed || 0;
+  document.getElementById('opsSummary').innerHTML = `
+    <div class="stat">
+      <div class="stat-title">В работе</div>
+      <div class="stat-value text-2xl text-info">${active}</div>
+      <div class="stat-desc">размещены, ждут доставки</div>
+    </div>
+    <div class="stat">
+      <div class="stat-title">На проверке</div>
+      <div class="stat-value text-2xl text-warning">${verifying}</div>
+      <div class="stat-desc">verifier сверяет дельту</div>
+    </div>
+    <div class="stat">
+      <div class="stat-title">Готово</div>
+      <div class="stat-value text-2xl text-success">${completed}</div>
+      <div class="stat-desc">доставлено и подтверждено</div>
+    </div>
+    <div class="stat">
+      <div class="stat-title">Ошибки</div>
+      <div class="stat-value text-2xl text-error">${failed}</div>
+      <div class="stat-desc">за последние 100 заказов</div>
+    </div>
+    <div class="stat">
+      <div class="stat-title">Потрачено</div>
+      <div class="stat-value text-2xl">${fmtMoney(spent)}</div>
+      <div class="stat-desc">по видимым заказам</div>
+    </div>`;
+}
+
+// ───────── запросы на пополнение ─────────
+async function refreshTopups() {
+  try {
+    const r = await fetch('/api/state/topups', { credentials: 'include' });
+    if (!r.ok) throw new Error(r.status);
+    const data = await r.json();
+    const box = document.getElementById('topupsBox');
+    if (!data.topups.length) {
+      box.innerHTML = '<div class="text-sm opacity-60">нет запросов на пополнение</div>';
+      return;
+    }
+    box.innerHTML = '';
+    for (const t of data.topups) {
+      const card = document.createElement('div');
+      card.className = 'p-2 bg-base-200 rounded text-sm';
+      card.innerHTML = `
+        <div class="flex justify-between items-start gap-2">
+          <div>
+            <div class="font-semibold">${escapeHTML(exchangeLabel(t.exchange))}</div>
+            <div class="text-xs opacity-70">нужно ${fmtMoney(t.requested_amount, t.currency)}</div>
+          </div>
+          <div class="flex gap-1">
+            <a href="${escapeHTML(t.topup_url)}" target="_blank" class="btn btn-xs btn-primary">Пополнить</a>
+            <button class="btn btn-xs btn-ghost cancelTopup" data-uuid="${escapeHTML(t.topup_uuid)}" title="Отменить запрос">✕</button>
+          </div>
+        </div>
+        <div class="text-xs opacity-60 mt-1">создан ${fmtAge(t.created_at)} назад${t.note ? ' · ' + escapeHTML(t.note) : ''}</div>`;
+      box.appendChild(card);
+    }
+    box.querySelectorAll('.cancelTopup').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const uuid = btn.dataset.uuid;
+        if (!uuid) return;
+        btn.disabled = true;
+        try {
+          await postJSON(`/api/state/topups/${encodeURIComponent(uuid)}/cancel`, {});
+          await refreshTopups();
+        } catch (err) {
+          btn.disabled = false;
+          alert('Не удалось отменить: ' + err.message);
+        }
+      });
+    });
+  } catch (e) {
+    console.error('topups:', e);
+  }
+}
+
+// ───────── график расходов ─────────
+let _chart = null;
+function updateSpendChart() {
+  const ctx = document.getElementById('spendChart');
+  if (!ctx) return;
+  const agg = {};
+  for (const o of _lastOrders) {
+    if (o.cost_actual === null || o.cost_actual === undefined) continue;
+    agg[o.exchange] = (agg[o.exchange] || 0) + o.cost_actual;
+  }
+  const labels = Object.keys(agg).map(exchangeLabel);
+  const data = Object.values(agg);
+  if (_chart) _chart.destroy();
+  _chart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Потрачено, ₽',
+        data,
+        backgroundColor: ['#2563eb', '#16a34a', '#f59e0b', '#dc2626', '#7c3aed'],
+        borderRadius: 6,
+      }],
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: { label: (ctx) => `${ctx.raw.toFixed(2)} ₽` },
+        },
+      },
+      scales: {
+        y: { beginAtZero: true, ticks: { callback: (v) => v + ' ₽' } },
+      },
+    },
+  });
+}
+
+// ───────── лента событий ─────────
+function renderEvent(ev) {
+  const t = new Date(ev.occurred_at);
+  const time = Number.isNaN(t.getTime()) ? '' : t.toTimeString().slice(0, 8);
+  const p = ev.payload || {};
+  let body = '';
+  let cls = 'border-l-2 border-base-300 pl-2 py-1';
+  if (ev.kind === 'tool_call') {
+    const tool = p.tool || 'tool';
+    const args = p.args ? JSON.stringify(p.args) : '';
+    const res = p.result ? JSON.stringify(p.result) : '';
+    let toolColor = 'border-info';
+    if (tool === 'place_order') toolColor = 'border-warning';
+    else if (tool === 'check_delta' || tool === 'report') toolColor = 'border-success';
+    else if (tool === 'get_topup_info') toolColor = 'border-secondary';
+    cls = `border-l-2 ${toolColor} pl-2 py-1`;
+    const label = TOOL_LABEL[tool] || tool;
+    body = `
+      <div class="flex justify-between gap-2">
+        <span class="font-semibold flex items-center gap-1.5">
+          <span class="tool-badge">${escapeHTML(tool)}</span>
+          ${escapeHTML(label)}
+        </span>
+        <span class="opacity-50">${time}</span>
+      </div>
+      <details class="text-xs opacity-80 mt-1">
+        <summary class="cursor-pointer opacity-70 hover:opacity-100">${escapeHTML(args.slice(0, 80))}${args.length > 80 ? '…' : ''}</summary>
+        <pre class="whitespace-pre-wrap break-all mt-1 text-[10px] opacity-70 bg-base-200 p-1 rounded">аргументы: ${escapeHTML(args)}\nответ: ${escapeHTML(res)}</pre>
+      </details>`;
+  } else if (ev.kind === 'report') {
+    cls = 'border-l-2 border-success pl-2 py-2 bg-base-200 rounded-r';
+    body = `
+      <div class="flex justify-between gap-2">
+        <span class="font-semibold text-success">📣 Отчёт пользователю</span>
+        <span class="opacity-50">${time}</span>
+      </div>
+      <div class="text-xs opacity-90 mt-1 whitespace-pre-wrap">${escapeHTML(p.summary_md || '')}</div>`;
+  } else if (ev.kind === 'dashboard_chat_user' || ev.kind === 'dashboard_chat_agent') {
+    const isAgent = ev.kind === 'dashboard_chat_agent';
+    cls = `border-l-2 ${isAgent ? 'border-primary' : 'border-base-300'} pl-2 py-1`;
+    body = `
+      <div class="flex justify-between gap-2">
+        <span class="font-semibold">${isAgent ? '🤖 Агент' : '👤 Пользователь (чат)'}</span>
+        <span class="opacity-50">${time}</span>
+      </div>
+      <div class="text-xs opacity-80">${escapeHTML((isAgent ? p.reply : p.message) || '').slice(0, 220)}</div>`;
+  } else if (ev.kind === 'dashboard_quote') {
+    const count = p.result?.quotes?.length || 0;
+    cls = 'border-l-2 border-secondary pl-2 py-1';
+    body = `
+      <div class="flex justify-between gap-2">
+        <span class="font-semibold">💸 Котировка с панели</span>
+        <span class="opacity-50">${time}</span>
+      </div>
+      <div class="text-xs opacity-80">${count} вариантов · дешевле всех ${escapeHTML(exchangeLabel(p.result?.cheapest || '—'))}</div>`;
+  } else if (ev.kind === 'order_status_changed') {
+    const from = STATUS_LABEL[p.from]?.[0] || p.from;
+    const to = STATUS_LABEL[p.to]?.[0] || p.to;
+    cls = 'border-l-2 border-info pl-2 py-1';
+    body = `
+      <div class="flex justify-between gap-2">
+        <span class="font-semibold">🔄 Смена статуса</span>
+        <span class="opacity-50">${time}</span>
+      </div>
+      <div class="text-xs opacity-80">${escapeHTML(from)} → ${escapeHTML(to)}${p.exchange ? ` · ${escapeHTML(exchangeLabel(p.exchange))}` : ''}</div>`;
+  } else if (ev.kind === 'verification_completed') {
+    cls = 'border-l-2 border-success pl-2 py-1';
+    const verdictLabel = {
+      auto_pass: '✅ авто-приёмка',
+      needs_human_review: '⚠️ нужна проверка',
+      fail: '❌ провал',
+    }[p.verdict] || p.verdict;
+    body = `
+      <div class="flex justify-between gap-2">
+        <span class="font-semibold">🔍 Верификация</span>
+        <span class="opacity-50">${time}</span>
+      </div>
+      <div class="text-xs opacity-80">${escapeHTML(verdictLabel)} · ${escapeHTML(p.reason || '')}</div>`;
+  } else if (ev.kind === 'topup_resolved') {
+    cls = 'border-l-2 border-success pl-2 py-1';
+    body = `
+      <div class="flex justify-between gap-2">
+        <span class="font-semibold text-success">💰 Пополнение получено</span>
+        <span class="opacity-50">${time}</span>
+      </div>
+      <div class="text-xs opacity-80">${escapeHTML(exchangeLabel(p.exchange || ''))} · ${fmtMoney(p.amount)}</div>`;
+  } else if (
+    ev.kind === 'place_order_failed' ||
+    ev.kind === 'quote_error' ||
+    ev.kind === 'dashboard_chat_error' ||
+    ev.kind === 'telegram_push_failed' ||
+    ev.kind === 'poll_error'
+  ) {
+    cls = 'border-l-2 border-error pl-2 py-1';
+    const kindLabel = {
+      place_order_failed: 'Не удалось разместить заказ',
+      quote_error: 'Ошибка котировки',
+      dashboard_chat_error: 'Ошибка чата',
+      telegram_push_failed: 'Сбой push в Telegram',
+      poll_error: 'Ошибка опроса биржи',
+    }[ev.kind] || ev.kind;
+    body = `
+      <div class="flex justify-between gap-2">
+        <span class="font-semibold text-error">⚠ ${escapeHTML(kindLabel)}</span>
+        <span class="opacity-50">${time}</span>
+      </div>
+      <div class="text-xs opacity-80">${escapeHTML(JSON.stringify(p).slice(0, 240))}</div>`;
+  } else {
+    body = `
+      <div class="flex justify-between gap-2">
+        <span class="opacity-70">${escapeHTML(ev.kind)}</span>
+        <span class="opacity-50">${time}</span>
+      </div>
+      <div class="text-xs opacity-70">${escapeHTML(JSON.stringify(p).slice(0, 220))}</div>`;
+  }
+  const div = document.createElement('div');
+  div.className = cls;
+  div.innerHTML = body;
+  return div;
+}
+function appendEventToFeed(ev) {
+  const box = document.getElementById('feedBox');
+  if (box.firstElementChild && box.firstElementChild.classList.contains('opacity-60')) {
+    box.innerHTML = '';
+  }
+  box.appendChild(renderEvent(ev));
+  while (box.children.length > 200) box.removeChild(box.firstChild);
+  box.scrollTop = box.scrollHeight;
+}
+
+// ───────── чат с агентом ─────────
+function appendChat(role, text, meta='') {
+  const box = document.getElementById('chatBox');
+  if (box.firstElementChild && box.firstElementChild.classList.contains('opacity-60')) {
+    box.innerHTML = '';
+  }
+  const node = document.createElement('div');
+  const isUser = role === 'user';
+  node.className = `chat ${isUser ? 'chat-end' : 'chat-start'}`;
+  node.innerHTML = `
+    <div class="chat-header text-xs opacity-60">${isUser ? 'Вы' : '🤖 Агент'} ${escapeHTML(meta)}</div>
+    <div class="chat-bubble ${isUser ? 'chat-bubble-primary' : 'chat-bubble-neutral'} whitespace-pre-wrap break-words">${escapeHTML(text)}</div>`;
+  box.appendChild(node);
+  while (box.children.length > 80) box.removeChild(box.firstChild);
+  box.scrollTop = box.scrollHeight;
+  return node;
+}
+function renderChatHistory(events) {
+  const chatEvents = events.filter((ev) =>
+    ev.kind === 'dashboard_chat_user' || ev.kind === 'dashboard_chat_agent'
+  );
+  const box = document.getElementById('chatBox');
+  box.innerHTML = '';
+  if (!chatEvents.length) {
+    box.innerHTML = '<div class="text-sm opacity-60">Напиши боту цель — он сам подберёт биржу и разместит заказ.</div>';
+    return;
+  }
+  for (const ev of chatEvents.slice(-20)) {
+    const p = ev.payload || {};
+    if (ev.kind === 'dashboard_chat_user') {
+      appendChat('user', p.message || '');
+    } else {
+      const meta = [p.model, p.duration_ms ? `${Math.round(p.duration_ms / 1000)} с` : '']
+        .filter(Boolean)
+        .join(' · ');
+      appendChat('agent', p.reply || '', meta);
+    }
+  }
+}
+document.getElementById('chatForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const input = document.getElementById('chatInput');
+  const send = document.getElementById('chatSend');
+  const message = input.value.trim();
+  const sessionId = document.getElementById('chatSession').value.trim() || 'dashboard';
+  if (!message) return;
+  appendChat('user', message);
+  input.value = '';
+  send.disabled = true;
+  const pending = appendChat('agent', 'думает...');
+  try {
+    const data = await postJSON('/api/agent/chat', { message, session_id: sessionId });
+    pending.remove();
+    const meta = [data.model, data.duration_ms ? `${Math.round(data.duration_ms / 1000)} с` : '']
+      .filter(Boolean)
+      .join(' · ');
+    appendChat('agent', data.reply, meta);
+    refreshAll();
+  } catch (err) {
+    pending.remove();
+    appendChat('agent', 'Ошибка: ' + err.message);
+  } finally {
+    send.disabled = false;
+    input.focus();
+  }
+});
+document.querySelectorAll('.quickPrompt').forEach((button) => {
+  button.addEventListener('click', () => {
+    document.getElementById('chatInput').value = button.dataset.prompt || '';
+    document.getElementById('chatInput').focus();
+  });
+});
+
+// ───────── котировки (форма) ─────────
+document.getElementById('quoteForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const button = document.getElementById('quoteButton');
+  const result = document.getElementById('quoteResult');
+  const payload = {
+    metric: document.getElementById('quoteMetric').value,
+    platform: document.getElementById('quotePlatform').value,
+    quantity: Number(document.getElementById('quoteQuantity').value),
+    target_url: document.getElementById('quoteTarget').value.trim() || 'dashboard://quote-only',
+  };
+  button.disabled = true;
+  result.innerHTML = '<div class="opacity-60">считаем у всех бирж параллельно...</div>';
+  try {
+    const data = await postJSON('/api/ops/quote', payload);
+    if (!data.quotes.length) {
+      result.innerHTML = '<div class="alert alert-warning py-2">Ни одна биржа не поддерживает этот запрос</div>';
+      return;
+    }
+    result.innerHTML = data.quotes.map((q, idx) => `
+      <div class="p-2 bg-base-200 rounded ${idx === 0 ? 'border-l-2 border-success' : ''}">
+        <div class="flex justify-between gap-2">
+          <span class="font-semibold">${escapeHTML(exchangeLabel(q.exchange))}${idx === 0 ? ' <span class="badge badge-success badge-xs">дешевле</span>' : ''}</span>
+          <span class="font-mono">${fmtMoney(q.total_price, q.currency)}</span>
+        </div>
+        <div class="text-xs opacity-70">
+          ${fmtMoney(q.price_per_unit, q.currency)}/шт · ${q.eta_minutes_min}–${q.eta_minutes_max} мин · надёжность ${Math.round(q.confidence * 100)}%
+        </div>
+      </div>`).join('');
+  } catch (err) {
+    result.innerHTML = `<div class="alert alert-error py-2">${escapeHTML(err.message)}</div>`;
+  } finally {
+    button.disabled = false;
+  }
+});
+
+// ───────── WebSocket ─────────
+let _ws = null;
+function connectWS() {
+  const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  const url = `${scheme}://${window.location.host}/ws/live`;
+  _ws = new WebSocket(url);
+  _ws.onopen = () => {
+    document.getElementById('wsLabel').textContent = 'онлайн';
+    document.getElementById('wsDot').style.background = '#16a34a';
+  };
+  _ws.onclose = () => {
+    document.getElementById('wsLabel').textContent = 'переподключение...';
+    document.getElementById('wsDot').style.background = '#f59e0b';
+    setTimeout(connectWS, 3000);
+  };
+  _ws.onerror = () => {
+    document.getElementById('wsLabel').textContent = 'ошибка';
+    document.getElementById('wsDot').style.background = '#dc2626';
+  };
+  _ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.kind === 'history') {
+      const box = document.getElementById('feedBox');
+      box.innerHTML = '';
+      for (const ev of msg.events) appendEventToFeed(ev);
+      renderChatHistory(msg.events);
+    } else if (msg.kind === 'event') {
+      appendEventToFeed(msg.event);
+      const t = msg.event.kind;
+      if (t === 'tool_call') {
+        const tool = msg.event.payload?.tool;
+        if (tool === 'place_order' || tool === 'get_balances' || tool === 'get_topup_info') {
+          refreshBalances();
+          refreshOrders();
+          refreshTopups();
+        }
+      } else if (t === 'order_status_changed' || t === 'verification_completed') {
+        refreshOrders();
+      } else if (t === 'topup_resolved') {
+        refreshTopups();
+        refreshBalances();
+      }
+    }
+  };
+}
+
+function refreshAll() {
+  refreshBalances();
+  refreshOrders();
+  refreshTopups();
+}
+
+refreshAll();
+connectWS();
+setInterval(refreshAll, 30000);
+</script>
+</body>
+</html>

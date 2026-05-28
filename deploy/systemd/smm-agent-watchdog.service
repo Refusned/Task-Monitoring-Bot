@@ -1,0 +1,11 @@
+[Unit]
+Description=SMM Agent watchdog health check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/root/smm-agent
+ExecStart=/root/smm-agent/.venv/bin/python /root/smm-agent/scripts/watchdog.py

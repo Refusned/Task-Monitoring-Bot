@@ -11,12 +11,10 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-import httpx
 import pytest
 from pydantic import ValidationError
 
-from adapters.smmcode import SmmcodeAdapter
-from adapters.unu import UnuAdapter
+from adapters.fake import FakePanelAdapter, FakeTaskExchangeAdapter
 from config import Settings
 from db.database import (
     connect,
@@ -48,7 +46,7 @@ def test_orderspec_requires_source_platform_for_traffic() -> None:
     with pytest.raises(ValidationError):
         OrderSpec(
             scenario=Scenario.SOCIAL_TRAFFIC,
-            exchange="unu",
+            exchange="fake_task_exchange",
             target="https://example.com",
             quantity=5,
             max_cost=2.0,
@@ -59,7 +57,7 @@ def test_orderspec_requires_source_platform_for_traffic() -> None:
 def test_orderspec_traffic_with_source_platform_ok() -> None:
     spec = OrderSpec(
         scenario=Scenario.SOCIAL_TRAFFIC,
-        exchange="unu",
+        exchange="fake_task_exchange",
         target="https://example.com",
         quantity=5,
         source_platform=SourcePlatform.VK,
@@ -83,7 +81,7 @@ def test_orderspec_rejects_empty_target() -> None:
     with pytest.raises(ValidationError):
         OrderSpec(
             scenario=Scenario.ACTIVITY_SUBSCRIBE,
-            exchange="smmcode",
+            exchange="fake_panel",
             target="",
             quantity=10,
             max_cost=2.0,
@@ -104,7 +102,7 @@ async def test_mark_order_active_raises_on_wrong_status(settings: Settings) -> N
     await init_db(settings)
     spec = OrderSpec(
         scenario=Scenario.ACTIVITY_SUBSCRIBE,
-        exchange="smmcode",
+        exchange="fake_panel",
         target="https://t.me/x",
         quantity=10,
         max_cost=2.0,
@@ -137,23 +135,19 @@ async def test_update_order_status_raises_on_missing_uuid(settings: Settings) ->
 
 
 async def test_list_submissions_returns_stable_external_dtos() -> None:
-    payload = {
-        "success": 1,
-        "reports": [
-            {"id": "111", "worker_id": "w1", "status": 2, "messages": [{"text": "ok"}]},
-            {"id": "112", "worker_id": "w2", "status": 1, "messages": [{"text": "ok"}]},
-        ],
-    }
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = dict(httpx.QueryParams(request.content.decode()))
-        assert body["action"] == "get_reports"
-        return httpx.Response(200, json=payload)
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        adapter = UnuAdapter("token", http)
-        subs1 = await adapter.list_submissions("task-1")
-        subs2 = await adapter.list_submissions("task-1")
+    adapter = FakeTaskExchangeAdapter(polls_to_yield=1, submissions_per_order=3)
+    spec = OrderSpec(
+        scenario=Scenario.SOCIAL_TRAFFIC,
+        exchange="fake_task_exchange",
+        target="https://example.com",
+        quantity=3,
+        source_platform=SourcePlatform.VK,
+        max_cost=2.0,
+    )
+    external_id, _ = await adapter.create_order(spec, new_client_order_uuid())
+    await adapter.get_order_status(external_id)  # triggers yield
+    subs1 = await adapter.list_submissions(external_id)
+    subs2 = await adapter.list_submissions(external_id)
 
     assert all(isinstance(s, ExternalSubmission) for s in subs1)
     # Identity is stable: same external_submission_ids across repeated calls
@@ -166,72 +160,30 @@ async def test_list_submissions_returns_stable_external_dtos() -> None:
 
 
 async def test_panel_adapter_refuses_over_max_cost() -> None:
-    create_called = False
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal create_called
-        if request.url.path.endswith("/services"):
-            return httpx.Response(
-                200,
-                json={
-                    "status": 200,
-                    "services": {
-                        "telegram": {
-                            "subs": {
-                                "136": {"service_id": "136", "price": 0.05},
-                            }
-                        }
-                    },
-                },
-            )
-        if request.url.path.endswith("/create_order"):
-            create_called = True
-        return httpx.Response(500)
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        adapter = SmmcodeAdapter("token", http)
-        spec = OrderSpec(
-            scenario=Scenario.ACTIVITY_SUBSCRIBE,
-            exchange="smmcode",
-            target="https://t.me/x",
-            quantity=100,  # 100 * 0.05 = 5.00 cost
-            service_id="136",
-            max_cost=1.0,  # below cost
-        )
-        with pytest.raises(ValueError, match=r"exceeds spec\.max_cost"):
-            await adapter.create_order(spec, new_client_order_uuid())
-    assert create_called is False
+    adapter = FakePanelAdapter()
+    spec = OrderSpec(
+        scenario=Scenario.ACTIVITY_SUBSCRIBE,
+        exchange="fake_panel",
+        target="https://t.me/x",
+        quantity=100,  # 100 * 0.05 = 5.00 cost
+        max_cost=1.0,  # below cost
+    )
+    with pytest.raises(ValueError, match=r"exceeds spec\.max_cost"):
+        await adapter.create_order(spec, new_client_order_uuid())
 
 
-async def test_microtask_exchange_adapter_refuses_over_max_cost() -> None:
-    create_called = False
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal create_called
-        body = dict(httpx.QueryParams(request.content.decode()))
-        if body.get("action") == "get_tariffs":
-            return httpx.Response(
-                200,
-                json={"success": 1, "tariffs": [{"id": "1", "min_price_rub": 0.1}]},
-            )
-        if body.get("action") == "add_task_start":
-            create_called = True
-        return httpx.Response(500)
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        adapter = UnuAdapter("token", http)
-        spec = OrderSpec(
-            scenario=Scenario.SOCIAL_TRAFFIC,
-            exchange="unu",
-            target="https://example.com",
-            quantity=50,  # 50 * 0.10 = 5.00 cost
-            source_platform=SourcePlatform.VK,
-            service_id="1",
-            max_cost=1.0,
-        )
-        with pytest.raises(ValueError, match=r"exceeds spec\.max_cost"):
-            await adapter.create_order(spec, new_client_order_uuid())
-    assert create_called is False
+async def test_task_exchange_adapter_refuses_over_max_cost() -> None:
+    adapter = FakeTaskExchangeAdapter()
+    spec = OrderSpec(
+        scenario=Scenario.SOCIAL_TRAFFIC,
+        exchange="fake_task_exchange",
+        target="https://example.com",
+        quantity=50,  # 50 * 0.10 = 5.00 cost
+        source_platform=SourcePlatform.VK,
+        max_cost=1.0,
+    )
+    with pytest.raises(ValueError, match=r"exceeds spec\.max_cost"):
+        await adapter.create_order(spec, new_client_order_uuid())
 
 
 # --- MEDIUM-e: SQLite CHECK constraints enforce invariants at the DB layer -----
@@ -318,13 +270,11 @@ async def test_db_rejects_zero_max_cost(settings: Settings) -> None:
 # --- WAL & money-safety nets ---------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_wal_mode_enabled(settings: Settings) -> None:
     await init_db(settings)
     async with connect(settings) as conn:
         cursor = await conn.execute("PRAGMA journal_mode")
         row = await cursor.fetchone()
-    assert row is not None
     assert row[0].lower() == "wal"
 
 

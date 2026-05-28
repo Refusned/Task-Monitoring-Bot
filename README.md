@@ -1,324 +1,95 @@
-<div align="center">
+# Exchange Order Monitor Bot — v4 pivot: LLM-агент-оркестратор + дашборд
 
-# Task Monitoring Bot
+После пересмотра ТЗ заказчиком превращён из «монитор заказов» в **полностью
+автономного LLM-агента** на OpenClaw + Ollama Cloud. Пользователь пишет в
+Telegram цель на естественном языке («накрути 200 лайков на YT-видео»), агент:
 
-**Коммерческий Telegram-бот для управления заказами на SMM-панелях и биржах микрозадач.**
+1. Параллельно запрашивает котировки у всех 5 бирж через `get_quote`.
+2. Получает балансы по каждой бирже (`get_balances`).
+3. Выбирает первую (от дешёвой к дорогой) биржу, где денег хватает.
+4. Снимает baseline-метрики на платформе (`capture_snapshot`) и размещает заказ.
+5. Если денег ни на одной бирже не хватает — отдаёт пользователю ссылку на
+   пополнение **самой дешёвой** биржи (`get_topup_info`); scheduler следит за
+   её балансом и автоматически возобновляет заказ после пополнения.
+6. После завершения заказа scheduler сам сверяет дельту с baseline через
+   `PlatformVerifier` (только YouTube Data API в MVP) и отчитывается пользователю
+   в Telegram + пуш на дашборд.
 
-`создание заказов -> мониторинг -> независимая проверка -> принятие / возврат -> отчётность`
+«Единой кассы» у бота нет — деньги живут на стороне бирж, бот не proxy для
+платежей. Полное обсуждение и обоснование — в плане `~/.claude/plans/…`.
 
-[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![aiogram](https://img.shields.io/badge/aiogram-3.x-2CA5E0?logo=telegram&logoColor=white)](https://docs.aiogram.dev/)
-[![Tests](https://img.shields.io/badge/tests-201%20passing-brightgreen)](#-качество)
-[![Lint](https://img.shields.io/badge/ruff-clean-success)](#-качество)
-[![Deploy](https://img.shields.io/badge/deploy-systemd-blue)](#-деплой)
-[![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
+## Стек
 
-</div>
-
----
-
-## О проекте
-
-Task Monitoring Bot автоматизирует рутинную работу заказчика с 5 площадками:
-`smmcode.shop`, `prskill.ru`, `unu.im`, `advego.com`, `ipgold.ru`.
-
-До этого процесс был ручным: зайти на биржу, создать заказ, дождаться статуса,
-проверить результат в сторонних системах, принять работу или вернуть исполнителю,
-а затем собрать недельный отчёт. Бот забирает этот цикл в Telegram и CLI:
-
-1. Создаёт заказ на нужной площадке.
-2. Мониторит статус по расписанию.
-3. Проверяет результат независимо от статуса биржи.
-4. Даёт администратору безопасно принять работу или вернуть её на доработку.
-5. Собирает еженедельную выгрузку по трафику в Google Sheets.
-
-Проект делался как клиентская разработка: с реальными API, реальными ограничениями
-по деньгам и приватными доступами, которые не попадают в репозиторий. Имя клиента,
-ключи и рабочие цели скрыты; публичная версия оставляет архитектуру, тесты и
-демо-режим.
-
----
-
-## Что показывает этот проект
-
-Это не учебный CRUD и не обёртка над одним API. Внутри есть задачи, которые хорошо
-показывают уровень backend/automation-разработки:
-
-- **5 внешних интеграций** с разными протоколами: REST/JSON, form API, XML-RPC поверх
-  `httpx`, read-only live smoke для проверенных ключей.
-- **Денежный lifecycle**: заказ нельзя случайно разместить дважды, сабмишен нельзя
-  оплатить повторно.
-- **Асинхронная оркестрация**: Telegram bot + scheduler + CLI работают поверх одного
-  состояния в SQLite WAL.
-- **Независимая верификация**: бот не доверяет словам биржи, а сверяет результат через
-  Яндекс.Метрику, UTM и счётчики активности.
-- **Удобный Telegram UX**: сценарии на кнопках, динамический каталог услуг, ручной
-  fallback, админские подтверждения.
-- **Тестовая сетка**: контрактные тесты адаптеров, fault injection, Telegram FSM,
-  money-safety кейсы, live read-only проверки.
-
----
-
-## Сценарии
-
-| Сценарий | Что делает бот | Как проверяет |
-|---|---|---|
-| Подписки в соцсетях | Создаёт заказ на подписку на целевой аккаунт | Сравнивает baseline и итоговый счётчик |
-| Лайки на новые посты | Находит новые посты и готовит заказ на лайки | Сравнивает рост активности по посту |
-| Переходы из соцсетей | Заказывает трафик из ВК, X, YouTube, Telegram, Дзен, Pinterest | Считает визиты в Яндекс.Метрике по UTM |
-| Ручной импорт | Подхватывает заказ, который уже создан на бирже | Ведёт его тем же lifecycle |
-
----
+- Python 3.11+ · asyncio
+- **OpenClaw** + `SOUL.md` (агент-шелл + Telegram-канал)
+- **Ollama Cloud** + `kimi-k2.6` (LLM, tool-calling); fallback `qwen3:32b`
+- **FastAPI** (tool-endpoints для агента + дашборд + WebSocket)
+- HTMX + TailwindCSS + DaisyUI + Chart.js (через CDN, без npm-сборки)
+- APScheduler (poll + verify + topup-recheck)
+- aiogram 3 (legacy CLI-демки) · aiosqlite WAL · pydantic v2 · httpx
+- pytest + ruff
 
 ## Архитектура
 
-```text
- Telegram bot (aiogram 3)        CLI
- /new_order /dashboard /review   smoke / monitor / verify / create-order
-          \                       /
-           \                     /
-            v                   v
-        +--------------------------------+
-        |         Orchestrator           |
-        | state machine + audit + C1/C2  |
-        +--------------------------------+
-          |             |              |
-          v             v              v
-   Exchange adapters  Verification   SQLite WAL
-   smmcode           TrafficVerifier orders
-   prskill           ActivityVerifier submissions
-   unu                               payments
-   advego                            action_log
-   ipgold                            report_rows
-          ^
-          |
-   APScheduler
-   poll_active_orders / poll_new_posts / weekly_report
-          |
-          v
-   Google Sheets export
+```
+User (Telegram) ──► OpenClaw + SOUL.md ──► Ollama Cloud (kimi-k2.6)
+                                                │ HTTP tool calls
+                                                ▼
+                    FastAPI (single process)
+                    ├─ /api/tools/* (8 endpoints для OpenClaw)
+                    ├─ /dashboard + /api/state/* (HTMX + WS)
+                    ├─► Orchestrator + 5 adapters (existing C1/C2)
+                    ├─► PlatformVerifier (YouTube Data API)
+                    ├─► APScheduler (poll → verify → recheck balances)
+                    └─► SQLite WAL
 ```
 
-Адаптеры разделены по типу площадки:
-
-| Тип | Площадки | Особенность |
-|---|---|---|
-| `PanelAdapter` | smmcode, prskill | Заказ предоплачен, нет per-submission accept/reject |
-| `TaskExchangeAdapter` | unu, advego, ipgold | Исполнители сдают отчёты, админ принимает или возвращает |
-
-Каждый адаптер декларирует capability-флаги: `CREATE_ORDER`, `LIST_SUBMISSIONS`,
-`ACCEPT_SUBMISSION`, `REJECT_SUBMISSION`, `GET_BALANCE`. Оркестратор смотрит на
-capabilities и не делает хрупких `isinstance`-ветвлений по конкретным биржам.
-
----
-
-## Money-safety
-
-В проекте есть два инварианта, вокруг которых построен lifecycle.
-
-### C1: заказ не размещается дважды
-
-Перед внешним API-вызовом бот создаёт локальную строку `orders` в статусе
-`creating`. После успешного ответа биржи пишет `external_order_id` и переводит заказ
-в `active`. Если процесс упал посередине, startup reconcile поднимает старые
-`creating`-строки и переводит их в безопасный статус вместо повторного размещения.
-
-### C2: сабмишен не оплачивается дважды
-
-Оплата защищена на уровне БД и приложения:
-
-- `payments(exchange, external_submission_id)` имеет уникальный ключ;
-- claim сабмишена делается атомарным conditional update;
-- HTTP-вызов к бирже выполняется вне DB-транзакции;
-- результат фиксируется через `action_log`;
-- повторный callback в Telegram не создаёт вторую оплату.
-
-Это важнее красивого UI: бот работает с деньгами, поэтому отказоустойчивость здесь
-часть продукта, а не техническая деталь.
-
----
-
-## Telegram UX
-
-Бот спроектирован для человека, который каждый день управляет заказами, а не для
-разработчика с терминалом.
-
-- Reply keyboard всегда под рукой: новый заказ, баланс, сводка, заказы, проверка,
-  очередь на ручное решение, отчёт, здоровье, отмена.
-- Inline FSM ведёт по шагам: сценарий -> биржа -> услуга -> URL -> количество ->
-  подтверждение.
-- Каталог услуг подтягивается с биржи и фильтруется под сценарий.
-- Перед созданием заказа показывается итоговая карточка с ценой и лимитами.
-- Денежные действия доступны только администратору.
-- CLI остаётся для smoke-проверок, отладки и автоматизации.
-
----
-
-## Интеграции
-
-| Интеграция | Реализация |
-|---|---|
-| Telegram | `aiogram 3`, FSM, reply/inline keyboards, admin whitelist |
-| smmcode.shop | REST/JSON + Perfect Panel style form API |
-| prskill.ru | REST/JSON + каталог услуг |
-| unu.im | API v1, задачи, отчёты, балансы, тарифы |
-| advego.com | XML-RPC поверх async `httpx` |
-| ipgold.ru | capability-gated адаптер под неподтверждённые методы API |
-| Яндекс.Метрика | проверка трафика по UTM |
-| Google Sheets | еженедельная выгрузка во вкладку «Трафик из соц сетей» |
-
----
-
-## Качество
+## Установка
 
 ```bash
-pytest
-ruff check .
-ruff format --check .
-```
-
-Покрытие проверок:
-
-| Блок | Что проверяется |
-|---|---|
-| Адаптеры | Парсинг JSON/XML, статусы, ошибки API, каталоги услуг |
-| Orchestrator | Lifecycle заказов, C1/C2, audit log, reconcile |
-| Telegram bot | FSM, callbacks, admin gating, full lifecycle через synthetic updates |
-| Verification | TrafficVerifier, ActivityVerifier, mock/live режимы |
-| Fault injection | Network errors, malformed payloads, mid-call crashes, token sanitization |
-| Live smoke | Read-only вызовы к реальным API при наличии credentials |
-
-Текущая публичная сборка: **201 tests passing**, `ruff` clean.
-
----
-
-## Быстрый старт
-
-```bash
-git clone https://github.com/Refusned/Task-Monitoring-Bot.git
-cd Task-Monitoring-Bot
-python3.11 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
-cp .env.example .env
+cp .env.example .env             # реквизиты 5 бирж
+cp agent/.env.example agent/.env # ключи Ollama / Telegram / dashboard token
 ```
 
-По умолчанию включён безопасный режим:
-
-```env
-DRY_RUN=true
-```
-
-Локальная проверка без денежных действий:
+## Запуск
 
 ```bash
+# Sanity-check: схема БД, регистрация адаптеров/верификаторов, мок-котировки.
+python cli.py agent-smoke
+
+# Backend: FastAPI tools + dashboard + scheduler в одном процессе.
+# Токен дашборда генерируется в консоль при первом старте.
+DRY_RUN=false python cli.py start
+
+# OpenClaw в отдельном процессе (см. https://docs.openclaw.ai):
+#   openclaw run agent/SOUL.md
+# (агент сам подключится к http://127.0.0.1:8000/api/tools/* с Bearer-токеном)
+
+# Старые команды Day-1..3 (legacy) — всё ещё работают для контрольных проверок:
 python cli.py smoke
-python cli.py monitor --dry-run
-pytest
+python cli.py demo
+python cli.py create-order --exchange smmcode --scenario activity_like --target https://... --quantity 100 --max-cost 0.50 --service-id <id>
 ```
 
-Запуск Telegram-бота:
+Дашборд: `http://127.0.0.1:8000/dashboard` —
+балансы по биржам, активные заказы, pending topups, live-лента tool-calls
+агента (главный showcase), graph расходов.
+
+## Тесты и линт
 
 ```bash
-python main.py
+pytest
+ruff check
 ```
 
----
+## Безопасность
 
-## Конфигурация
-
-Все изменяемые параметры вынесены в `.env`.
-
-| Переменная | Назначение |
-|---|---|
-| `DRY_RUN` | Блокирует write-действия на биржах |
-| `DAILY_SPEND_LIMIT`, `PER_ORDER_SPEND_LIMIT` | Суточный лимит и лимит на заказ |
-| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ADMIN_IDS` | Telegram bot и список админов |
-| `SMMCODE_API_KEY`, `UNU_API_KEY`, `ADVEGO_API_TOKEN`, `PRSKILL_API_KEY`, `IPGOLD_API_KEY` | Доступы к биржам |
-| `METRICA_COUNTER_ID`, `METRICA_OAUTH_TOKEN` | Проверка трафика через Яндекс.Метрику |
-| `GOOGLE_SHEETS_CREDENTIALS_FILE`, `GOOGLE_SHEETS_SPREADSHEET_ID` | Еженедельный отчёт |
-| `TARGET_WEBSITE_URL`, `TARGET_SOCIAL_ACCOUNTS` | Рабочие цели клиента |
-
-`.env` и runtime-файлы находятся в `.gitignore`. В репозитории есть только
-`.env.example` без секретов.
-
----
-
-## Деплой
-
-Бот рассчитан на запуск как обычный Linux service: отдельный пользователь, venv,
-file lock против второго процесса, restart policy, закрытые права на `.env`.
-
-Пример unit-файла:
-
-```ini
-[Unit]
-Description=Exchange Order Monitor Bot
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=exchangebot
-Group=exchangebot
-WorkingDirectory=/opt/exchange-monitor-bot
-Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/exchange-monitor-bot/.venv/bin/python /opt/exchange-monitor-bot/main.py
-Restart=always
-RestartSec=10
-TimeoutStopSec=30
-UMask=0077
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-```
-
----
-
-## Структура
-
-```text
-.
-├── adapters/          # 5 бирж, base ABC, capability flags
-├── bot/               # aiogram handlers и keyboards
-├── db/                # schema, WAL setup, claim helpers, audit log
-├── verification/      # TrafficVerifier и ActivityVerifier
-├── reporting/         # Google Sheets writer
-├── posts/             # watcher новых постов
-├── tests/             # unit, integration, fault-injection, live smoke
-├── docs/
-│   ├── DESIGN.md      # архитектурный разбор
-│   └── api/           # заметки по API бирж
-├── cli.py             # smoke / monitor / verify / create-order
-├── main.py            # Telegram polling + scheduler
-├── orchestrator.py    # state machine и money-safety
-├── config.py          # pydantic-settings
-└── models.py          # доменные модели и статусы
-```
-
----
-
-## Документация
-
-- [docs/DESIGN.md](./docs/DESIGN.md) — архитектура, lifecycle, инварианты, trade-offs.
-- [docs/api](./docs/api/) — заметки по API каждой площадки.
-- [docs/demo.html](./docs/demo.html) — локальная презентация продукта.
-- [CLAUDE.md](./CLAUDE.md) — технический контекст для AI-assisted разработки.
-
----
-
-## Безопасность и комплаенс
-
-- Только авторизованные аккаунты и предоставленные клиентом доступы.
-- Без обхода антибот-систем и без сбора чужих учётных данных.
-- Денежные действия подтверждаются администратором, auto-accept включается только
-  через конфиг.
-- Все write-действия блокируются `DRY_RUN=true` в публичной конфигурации.
-- Токены маскируются в логах и Telegram-сообщениях.
-
----
-
-## Лицензия
-
-MIT — см. [LICENSE](LICENSE).
+- Все секреты — в `.env` (не коммитится).
+- `DASHBOARD_TOKEN` генерируется автоматически при первом старте; вставляется в форму входа.
+- `AGENT_TOOLS_TOKEN` отделён от дашборда и передаётся только OpenClaw tools runtime.
+- Идемпотентность денежных операций (C1 — не разместить дважды, C2 — не оплатить
+  дважды) реализована на уровне Python+SQLite, **не** на правилах SOUL.md.
+- Реальные creds 5 бирж — в `../test_task.txt` (вне репозитория).

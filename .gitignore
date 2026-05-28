@@ -25,11 +25,8 @@ ENV/
 *.db-wal
 *.db-shm
 bot.log
-bot_live.log
-logs/
 bot.lock
 bot.pid
-.watcher_state.json
 
 # Testing / linting caches
 .pytest_cache/
@@ -43,3 +40,4 @@ htmlcov/
 .idea/
 .vscode/
 *.swp
+.watcher_state.json

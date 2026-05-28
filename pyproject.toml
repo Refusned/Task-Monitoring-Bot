@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "exchange-monitor-bot"
 version = "0.1.0"
-description = "Commercial Telegram bot for managing SMM and microtask exchange order lifecycles"
+description = "Bot for managing the order lifecycle on SMM / microtask exchanges (test task)"
 requires-python = ">=3.11"
 dependencies = [
     "aiogram>=3.4,<4",
@@ -16,7 +16,11 @@ dependencies = [
     "pydantic-settings>=2.2",
     "gspread>=6.0",
     "google-auth>=2.29",
-    "typer>=0.12",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.12",
+    "telethon>=1.36",
 ]
 
 [project.optional-dependencies]
@@ -27,8 +31,8 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["config", "models", "cli", "conftest", "main"]
-packages = ["db", "adapters", "bot", "posts", "reporting"]
+py-modules = ["config", "models", "cli", "conftest", "orchestrator"]
+packages = ["db", "adapters", "verification", "app", "scheduler"]
 
 [tool.ruff]
 line-length = 100

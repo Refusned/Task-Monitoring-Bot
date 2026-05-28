@@ -1,0 +1,4 @@
+Bot started. Press Ctrl+C to stop.
+Failed to fetch updates - TelegramNetworkError: HTTP Client says - ServerDisconnectedError: Server disconnected
+Sleep for 1.000000 seconds and try again... (tryings = 0, bot id = 8935147286)
+Shutdown complete.

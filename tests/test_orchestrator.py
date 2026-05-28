@@ -1,282 +1,262 @@
-"""Tests for orchestrator: polling, verification, accept/reject, C2 money-safety."""
+"""Day 3 orchestrator tests: full lifecycle on fake adapters."""
 
 from __future__ import annotations
 
-import hashlib
-import os
-import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from adapters.fake import FakePanelAdapter, FakeTaskExchangeAdapter
 from config import Settings
-from db.database import (
-    connect,
-    get_order,
-    get_submission,
-    get_submissions_for_order,
-    init_db,
-    insert_order_creating,
-    insert_submission,
-    list_active_orders,
-    mark_order_active,
-    payment_exists,
+from db.database import connect, get_order, init_db, insert_order_creating
+from models import (
+    Order,
+    OrderSpec,
+    OrderStatus,
+    Scenario,
+    SourcePlatform,
+    SubmissionStatus,
+    new_client_order_uuid,
 )
-from models import Order, OrderSpec, OrderStatus, Scenario, SourcePlatform, Submission
 from orchestrator import Orchestrator
 
 
-def _settings(db_path: str) -> Settings:
-    return Settings(
-        dry_run=True,
-        db_path=Path(db_path),
-        auto_accept_threshold_cost=0.0,
-        daily_spend_limit=1000.0,
-        per_order_spend_limit=200.0,
+@pytest.fixture
+def settings(tmp_path: Path) -> Settings:
+    return Settings(db_path=tmp_path / "test.db")
+
+
+def make_orchestrator(settings: Settings) -> Orchestrator:
+    return Orchestrator(
+        settings,
+        {
+            "fake_panel": FakePanelAdapter(),
+            "fake_task_exchange": FakeTaskExchangeAdapter(),
+        },
     )
 
 
-def _make_order_spec(scenario: Scenario) -> OrderSpec:
-    if scenario == Scenario.SOCIAL_TRAFFIC:
-        return OrderSpec(
-            scenario=scenario,
-            exchange="unu",
-            target="https://example.com",
-            quantity=5,
-            source_platform=SourcePlatform.VK,
-            max_cost=2.0,
-        )
-    return OrderSpec(
-        scenario=scenario,
-        exchange="smmcode",
-        target="https://t.me/test",
+async def test_panel_full_lifecycle(settings: Settings) -> None:
+    await init_db(settings)
+    orch = make_orchestrator(settings)
+    spec = OrderSpec(
+        scenario=Scenario.ACTIVITY_SUBSCRIBE,
+        exchange="fake_panel",
+        target="https://t.me/x",
         quantity=10,
         max_cost=2.0,
     )
+    uuid_, _, _ = await orch.create_order(spec, actor="test")
+
+    # First poll: in_progress -> stays ACTIVE.
+    s1 = await orch.poll_order(uuid_)
+    assert s1 == OrderStatus.ACTIVE
+
+    # Second poll: completed -> VERIFYING -> COMPLETED.
+    s2 = await orch.poll_order(uuid_)
+    assert s2 == OrderStatus.COMPLETED
 
 
-def _make_adapters(dry_run: bool = True) -> dict:
-    return {}
-
-
-@pytest.fixture
-async def db():
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        path = f.name
-    settings = _settings(path)
+async def test_task_exchange_full_lifecycle(settings: Settings) -> None:
     await init_db(settings)
-    yield settings
-    os.unlink(path)
+    orch = make_orchestrator(settings)
+    spec = OrderSpec(
+        scenario=Scenario.SOCIAL_TRAFFIC,
+        exchange="fake_task_exchange",
+        target="https://example.com",
+        quantity=3,
+        source_platform=SourcePlatform.VK,
+        max_cost=2.0,
+    )
+    uuid_, _, _ = await orch.create_order(spec, actor="test")
+
+    # Tick 1: submissions appear and are processed (auto-accept good / auto-reject weak).
+    await orch.poll_order(uuid_)
+    # Tick 2: exchange reports completed.
+    s = await orch.poll_order(uuid_)
+    assert s == OrderStatus.COMPLETED
+
+    # Verify final submission statuses: 2 accepted, 1 rework_requested
+    # (matches fake adapter's deterministic evidence_quality: good, good, weak).
+    async with connect(settings) as conn:
+        cur = await conn.execute(
+            "SELECT status FROM submissions WHERE order_uuid = ? ORDER BY created_at",
+            (uuid_,),
+        )
+        statuses = sorted(r["status"] for r in await cur.fetchall())
+    assert statuses == sorted(
+        [
+            SubmissionStatus.ACCEPTED.value,
+            SubmissionStatus.ACCEPTED.value,
+            SubmissionStatus.REWORK_REQUESTED.value,
+        ]
+    )
 
 
-@pytest.mark.asyncio
-async def test_poll_empty(db: Settings) -> None:
-    orch = Orchestrator(db, adapters=_make_adapters())
-    results = await orch.poll_all()
-    assert results == []
-    async with connect(db) as conn:
-        active = await list_active_orders(conn)
-    assert active == []
+async def test_live_mode_demo_verifier_does_not_auto_accept(settings: Settings) -> None:
+    """Fake verifier hints are allowed in DRY_RUN demos, not in live money mode."""
+    settings.dry_run = False
+    await init_db(settings)
+    orch = make_orchestrator(settings)
+    spec = OrderSpec(
+        scenario=Scenario.SOCIAL_TRAFFIC,
+        exchange="fake_task_exchange",
+        target="https://example.com",
+        quantity=3,
+        source_platform=SourcePlatform.VK,
+        max_cost=2.0,
+    )
+    uuid_, _, _ = await orch.create_order(spec, actor="test")
+
+    await orch.poll_order(uuid_, actor="test")
+
+    async with connect(settings) as conn:
+        cur = await conn.execute(
+            "SELECT status FROM submissions WHERE order_uuid = ? ORDER BY created_at",
+            (uuid_,),
+        )
+        statuses = sorted(r["status"] for r in await cur.fetchall())
+    assert statuses == sorted(
+        [
+            SubmissionStatus.AWAITING_ADMIN.value,
+            SubmissionStatus.AWAITING_ADMIN.value,
+            SubmissionStatus.REWORK_REQUESTED.value,
+        ]
+    )
 
 
-@pytest.mark.asyncio
-@pytest.mark.skip(reason="Simulated adapter lifecycle was removed")
-async def test_panel_lifecycle(db: Settings) -> None:
-    adapters = _make_adapters()
-    spec = _make_order_spec(Scenario.ACTIVITY_SUBSCRIBE)
-    client_uuid = "panel-uuid-1"
-    ext_id, cost = await adapters["smmcode"].create_order(spec, client_uuid)
+async def test_poll_unknown_order_raises(settings: Settings) -> None:
+    await init_db(settings)
+    orch = make_orchestrator(settings)
+    with pytest.raises(ValueError, match="not found"):
+        await orch.poll_order("nonexistent")
 
+
+async def test_poll_terminal_order_is_noop(settings: Settings) -> None:
+    """Polling an order that's already COMPLETED returns the same status without
+    touching the adapter or writing further state transitions.
+    """
+    await init_db(settings)
+    orch = make_orchestrator(settings)
+    spec = OrderSpec(
+        scenario=Scenario.ACTIVITY_SUBSCRIBE,
+        exchange="fake_panel",
+        target="https://t.me/x",
+        quantity=10,
+        max_cost=2.0,
+    )
+    uuid_, _, _ = await orch.create_order(spec, actor="test")
+    await orch.poll_order(uuid_)
+    final = await orch.poll_order(uuid_)
+    assert final == OrderStatus.COMPLETED
+
+    # Third poll on the terminal order: returns COMPLETED without raising.
+    again = await orch.poll_order(uuid_)
+    assert again == OrderStatus.COMPLETED
+
+
+async def test_reconcile_creating_marks_failed(settings: Settings) -> None:
+    """Orphan CREATING row (crash mid-placement) -> FAILED with audit entry."""
+    await init_db(settings)
+    spec = OrderSpec(
+        scenario=Scenario.ACTIVITY_SUBSCRIBE,
+        exchange="fake_panel",
+        target="x",
+        quantity=1,
+        max_cost=1.0,
+    )
+    now = datetime.now(UTC)
+    client_uuid = new_client_order_uuid()
     order = Order(
         client_order_uuid=client_uuid,
         spec=spec,
-        status=OrderStatus.ACTIVE,
-        external_order_id=ext_id,
-        cost_actual=cost,
-        created_at=datetime.now(UTC),
-        updated_at=datetime.now(UTC),
+        status=OrderStatus.CREATING,
+        created_at=now,
+        updated_at=now,
     )
-    async with connect(db) as conn:
+    async with connect(settings) as conn:
         await insert_order_creating(conn, order)
-        await mark_order_active(conn, client_uuid, ext_id, cost)
 
-    orch = Orchestrator(db, adapters=adapters)
-    results = await orch.poll_all()
-    assert len(results) == 1
+    orch = make_orchestrator(settings)
+    # min_age_seconds=0: the test inserts a fresh row and reconciles
+    # immediately; production default (300s) is exercised in test_idempotency.
+    fixed = await orch.reconcile_creating(min_age_seconds=0)
+    assert fixed == 1
 
-    async with connect(db) as conn:
-        stored = await get_order(conn, client_uuid)
-    assert stored is not None
-    assert stored.status in (OrderStatus.COMPLETED, OrderStatus.FAILED, OrderStatus.VERIFYING)
+    async with connect(settings) as conn:
+        recovered = await get_order(conn, client_uuid)
+        cur = await conn.execute(
+            "SELECT event FROM audit_log WHERE order_uuid = ? AND event = ?",
+            (client_uuid, "reconcile_creating_to_failed"),
+        )
+        rows = await cur.fetchall()
+    assert recovered is not None
+    assert recovered.status == OrderStatus.FAILED
+    assert len(rows) == 1
 
 
-@pytest.mark.asyncio
-@pytest.mark.skip(reason="Simulated adapter lifecycle was removed")
-async def test_microtask_exchange_submissions(db: Settings) -> None:
-    adapters = _make_adapters()
-    spec = _make_order_spec(Scenario.SOCIAL_TRAFFIC)
-    client_uuid = "task-uuid-1"
-    ext_id, cost = await adapters["unu"].create_order(spec, client_uuid)
+async def test_reconcile_with_no_creating_rows_is_noop(settings: Settings) -> None:
+    await init_db(settings)
+    orch = make_orchestrator(settings)
+    fixed = await orch.reconcile_creating()
+    assert fixed == 0
 
-    order = Order(
-        client_order_uuid=client_uuid,
-        spec=spec,
-        status=OrderStatus.ACTIVE,
-        external_order_id=ext_id,
-        cost_actual=cost,
-        created_at=datetime.now(UTC),
-        updated_at=datetime.now(UTC),
+
+async def test_task_order_stays_verifying_when_submission_awaiting_admin(
+    settings: Settings,
+) -> None:
+    """HIGH-5 fix: a task-exchange order whose exchange-side status is `completed`
+    but with a local submission in AWAITING_ADMIN must NOT auto-close. The
+    orchestrator keeps it in VERIFYING until the admin resolves the submission.
+    """
+    import uuid as _uuid
+
+    from db.database import insert_submission
+    from models import Submission, SubmissionStatus
+
+    await init_db(settings)
+    # `submissions_per_order=0` makes the fake task adapter report `completed`
+    # on its first poll without ever yielding submissions of its own.
+    orch = Orchestrator(
+        settings,
+        {
+            "fake_panel": FakePanelAdapter(),
+            "fake_task_exchange": FakeTaskExchangeAdapter(
+                polls_to_yield=1, submissions_per_order=0
+            ),
+        },
     )
-    async with connect(db) as conn:
-        await insert_order_creating(conn, order)
-        await mark_order_active(conn, client_uuid, ext_id, cost)
-
-    orch = Orchestrator(db, adapters=adapters)
-    results = await orch.poll_all()
-    assert len(results) == 1
-
-    async with connect(db) as conn:
-        subs = await get_submissions_for_order(conn, client_uuid)
-    assert len(subs) == 3
-
-
-@pytest.mark.asyncio
-@pytest.mark.skip(reason="Simulated adapter lifecycle was removed")
-async def test_microtask_exchange_accept_reject(db: Settings) -> None:
-    adapters = _make_adapters()
-    spec = _make_order_spec(Scenario.SOCIAL_TRAFFIC)
-    client_uuid = "task-uuid-2"
-    ext_id, cost = await adapters["unu"].create_order(spec, client_uuid)
-
-    order = Order(
-        client_order_uuid=client_uuid,
-        spec=spec,
-        status=OrderStatus.ACTIVE,
-        external_order_id=ext_id,
-        cost_actual=cost,
-        created_at=datetime.now(UTC),
-        updated_at=datetime.now(UTC),
+    spec = OrderSpec(
+        scenario=Scenario.SOCIAL_TRAFFIC,
+        exchange="fake_task_exchange",
+        target="https://example.com",
+        quantity=1,
+        source_platform=SourcePlatform.VK,
+        max_cost=1.0,
     )
-    async with connect(db) as conn:
-        await insert_order_creating(conn, order)
-        await mark_order_active(conn, client_uuid, ext_id, cost)
+    uuid_, _, _ = await orch.create_order(spec, actor="test")
 
-    orch = Orchestrator(db, adapters=adapters)
-
-    # Round 1: poll creates submissions, verifies them
-    await orch.poll_all()
-    # Round 2: exchange now sees all resolved -> completed
-    await orch.poll_all()
-
-    async with connect(db) as conn:
-        subs = await get_submissions_for_order(conn, client_uuid)
-        stored = await get_order(conn, client_uuid)
-
-    assert stored is not None
-    for s in subs:
-        assert s.status in ("accepted", "rework_requested", "failed", "awaiting_admin")
-
-    accepted_subs = [s for s in subs if s.status == "accepted"]
-    for s in accepted_subs:
-        async with connect(db) as conn:
-            assert await payment_exists(conn, spec.exchange, s.external_submission_id or "")
-
-    if stored.status == OrderStatus.COMPLETED:
-        assert all(s.status in ("accepted", "rework_requested", "failed") for s in subs)
-
-
-@pytest.mark.asyncio
-@pytest.mark.skip(reason="Simulated adapter lifecycle was removed")
-async def test_c2_no_double_pay(db: Settings) -> None:
-    """C2: simulate calling accept twice; second must be skipped."""
-    adapters = _make_adapters()
-    spec = _make_order_spec(Scenario.SOCIAL_TRAFFIC)
-    client_uuid = "task-uuid-3"
-    ext_id, cost = await adapters["unu"].create_order(spec, client_uuid)
-
-    order = Order(
-        client_order_uuid=client_uuid,
-        spec=spec,
-        status=OrderStatus.ACTIVE,
-        external_order_id=ext_id,
-        cost_actual=cost,
-        created_at=datetime.now(UTC),
-        updated_at=datetime.now(UTC),
-    )
-    async with connect(db) as conn:
-        await insert_order_creating(conn, order)
-        await mark_order_active(conn, client_uuid, ext_id, cost)
-
-    orch = Orchestrator(db, adapters=adapters)
-    await orch.poll_all()
-
-    # Force re-run of resolution to test duplicate guard
-    task_adapter = adapters["unu"]
-
-    assert task_adapter is not None
-    async with connect(db) as conn:
-        subs = await get_submissions_for_order(conn, client_uuid)
-    for sub in subs:
-        if sub.status == "new":
-            await orch._verify_and_decide_submission(order, task_adapter, sub)
-
-    async with connect(db) as conn:
-        subs = await get_submissions_for_order(conn, client_uuid)
-
-    for s in subs:
-        async with connect(db) as conn:
-            exists = await payment_exists(conn, spec.exchange, s.external_submission_id or "")
-        if s.status == "accepted":
-            assert exists
-
-
-@pytest.mark.asyncio
-@pytest.mark.skip(reason="Admin accept integration needs real exchange adapter credentials")
-async def test_admin_accept_completes_human_reviewed_submission(db: Settings) -> None:
-    adapters = _make_adapters()
-    spec = _make_order_spec(Scenario.SOCIAL_TRAFFIC)
-    spec = spec.model_copy(update={"exchange": "unu"})
-    client_uuid = "task-admin-1"
-    ext_id = "unu-task-admin1"
-    suffix = hashlib.sha1(ext_id.encode("utf-8")).hexdigest()[:8]
-    ext_sub_id = f"unu-sub-{suffix}-1"
-
-    order = Order(
-        client_order_uuid=client_uuid,
-        spec=spec,
-        status=OrderStatus.ACTIVE,
-        external_order_id=ext_id,
-        cost_actual=0.5,
-        created_at=datetime.now(UTC),
-        updated_at=datetime.now(UTC),
-    )
-    sub = Submission(
-        submission_uuid="admin-sub-1",
-        order_uuid=client_uuid,
-        external_submission_id=ext_sub_id,
-        executor_hint="executor-1",
-        status="awaiting_admin",
-        evidence="manual",
+    # Inject a submission in AWAITING_ADMIN directly (simulating a previous
+    # poll that produced an unknown-evidence verdict).
+    pending = Submission(
+        submission_uuid=str(_uuid.uuid4()),
+        order_uuid=uuid_,
+        external_submission_id="manual-ext-1",
+        executor_hint=None,
+        status=SubmissionStatus.AWAITING_ADMIN,
+        evidence="unknown",
         created_at=datetime.now(UTC),
     )
+    async with connect(settings) as conn:
+        await insert_submission(conn, pending)
 
-    async with connect(db) as conn:
-        await insert_order_creating(conn, order)
-        await mark_order_active(conn, client_uuid, ext_id, 0.5)
-        await insert_submission(conn, sub)
+    # Poll: adapter says `completed`, but our DB has an AWAITING_ADMIN submission.
+    # Order must stay in VERIFYING, not COMPLETED.
+    result = await orch.poll_order(uuid_, actor="test")
+    assert result == OrderStatus.VERIFYING
 
-    orch = Orchestrator(db, adapters=adapters)
-    decision = await orch.admin_accept_submission(sub.submission_uuid, actor="test")
-
-    async with connect(db) as conn:
-        stored_sub = await get_submission(conn, sub.submission_uuid)
-        stored_order = await get_order(conn, client_uuid)
-        paid = await payment_exists(conn, spec.exchange, ext_sub_id)
-
-    assert decision["decision"] == "accepted"
-    assert stored_sub is not None
-    assert stored_sub.status == "accepted"
-    assert stored_order is not None
-    assert stored_order.status == OrderStatus.COMPLETED
-    assert paid
+    async with connect(settings) as conn:
+        order = await get_order(conn, uuid_)
+    assert order is not None
+    assert order.status == OrderStatus.VERIFYING

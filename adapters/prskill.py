@@ -1,21 +1,19 @@
-"""Real adapter for the prskill.ru reseller API.
+"""Real adapter for the prskill.ru SMM-panel reseller API.
 
-API form: POST form-encoded per-method endpoint, JSON responses, auth via `key`+`action`.
-Docs reference: `docs/api/prskill.md`.
+API form: POST `https://prskill.ru/api/v2` with body params `key=<api_key>` +
+`action=<balance|services|add|status>` (the "Perfect Panel" reseller dispatch
+shape, widely used across Russian SMM panels). Responses JSON.
 
-Notable behaviours:
+Status: NOT yet exercised against a live key — PRSKILL_API_KEY hasn't been
+provisioned at this stage. The adapter ships with the Perfect-Panel shape (this
+is what the doc summary in CLAUDE.md describes: "reseller API, key+action") and
+will be smoke-tested when credentials land. Capabilities are declared
+honestly per Day 4 plan: panel scope only, no submission cycle.
 
-- **Estimate-first cost check** (HIGH-c invariant). Before placing, the adapter fetches
-  the services catalogue (cached), finds `service_id`, computes `cost = rate * quantity`,
-  and refuses if it exceeds `spec.max_cost`. The `/add` endpoint is NOT called when the
-  cap is exceeded - tests assert this.
-- **Status mapping.** Raw status strings from the API are mapped to our normalized
-  `'in_progress' | 'completed' | 'failed'` per the table in `docs/api/prskill.md`.
-- **No client order id support.** The reseller API does not accept a client-side
-  identifier; `client_order_uuid` (C1) lives only in our SQLite.
-- **No balance endpoint** is documented on the public API page. `get_balance` returns
-  `0.0` and logs a warning so the orchestrator can continue; real balance checks should
-  be done via the web cabinet or by summing active order costs against a known deposit.
+Notable behaviours mirror smmcode:
+- Estimate-first cost check against the cached `services` catalogue.
+- Conservative status map (anything we don't recognize -> failed).
+- The reseller API does NOT accept client-side order ids.
 """
 
 from __future__ import annotations
@@ -25,25 +23,30 @@ from typing import Any
 
 import httpx
 
-from adapters.base import Capability, PanelAdapter, ServiceOption, keywords_for_scenario
-from models import OrderSpec, Scenario
+from adapters.base import Capability, PanelAdapter, quote_from_mock
+from models import OrderSpec, Quote, SourcePlatform, TaskType, TopupInfo
 
-_BASE_URL = "https://prskill.ru/api"
-_SERVICES_TTL_SECONDS = 300.0
+_BASE_URL = "https://prskill.ru/api"  # docs at https://prskill.ru/api confirm: no /v2 suffix
+_SERVICES_TTL_SECONDS = 60.0
 
-# Raw string status -> normalized status. Source: docs/api/prskill.md.
+# Raw `status` string (lowercase) -> normalized status. The Perfect Panel
+# convention; conservative ("unknown -> failed") so we never silently finalize.
 _STATUS_MAP: dict[str, str] = {
-    "process": "in_progress",
-    "success": "completed",
-    "cancel": "failed",
-    "piece": "completed",
-    "fail": "failed",
-    "check": "in_progress",
+    "pending": "in_progress",
+    "in progress": "in_progress",
+    "in_progress": "in_progress",
+    "processing": "in_progress",
+    "completed": "completed",
+    "partial": "completed",
+    "canceled": "failed",
+    "cancelled": "failed",
+    "refunded": "failed",
+    "error": "failed",
 }
 
 
-class PrskillAdapter(PanelAdapter):
-    """prskill.ru reseller adapter."""
+class PrSkillAdapter(PanelAdapter):
+    """prskill.ru reseller adapter (Perfect Panel form: key + action)."""
 
     name = "prskill"
 
@@ -56,155 +59,112 @@ class PrskillAdapter(PanelAdapter):
         self._services_cache_at: float = 0.0
 
     def capabilities(self) -> set[Capability]:
-        # NB: GET_BALANCE intentionally absent — prskill's public API has no
-        # `balance` action ("The selected action is invalid" on POST). The bot's
-        # /balance reply will honestly show "баланс не отдаётся API" rather than
-        # a fake 0.00. Track balance via the web cabinet.
         return {
             Capability.CREATE_ORDER,
             Capability.GET_ORDER_STATUS,
+            # GET_BALANCE intentionally NOT here: prskill public API doesn't expose it.
+            Capability.GET_QUOTE,
+            Capability.GET_TOPUP_INFO,
+            # No client-side ids on reseller APIs.
         }
 
-    async def get_balance(self) -> float:
-        raise NotImplementedError(
-            "prskill API does not expose a balance endpoint; track balance via the web cabinet"
+    async def get_quote(
+        self, metric: TaskType, platform: SourcePlatform, quantity: int
+    ) -> Quote | None:
+        """Mock-only for MVP — prskill credentials weren't provisioned at the time
+        of writing. Falls back to config mock_quotes_csv. To go real: hardcode a
+        service_id map (same pattern as smmcode) and call _service_price."""
+        from config import get_settings
+
+        return quote_from_mock(
+            self.name, metric, platform, quantity, get_settings().mock_quotes_csv,
+            confidence=0.4,
         )
+
+    async def get_topup_info(self) -> TopupInfo:
+        return TopupInfo(
+            exchange=self.name,
+            topup_url="https://prskill.ru/payments",
+            min_amount=10.0,
+            currency="RUB",
+            payment_methods=["card", "yoomoney", "qiwi", "usdt"],
+            notes="Кошелёк prskill, не наш. Пополни через личный кабинет.",
+        )
+
+    async def get_balance(self) -> float | None:
+        # prskill's public API has no `balance` method — confirmed against
+        # docs at https://prskill.ru/api on 2026-05-28 (only `services`,
+        # `add`, `status` exist). Return None so the dashboard renders
+        # "нет API" instead of a fake "устарел" badge.
+        return None
 
     async def create_order(self, spec: OrderSpec, client_order_uuid: str) -> tuple[str, float]:
         if not spec.service_id:
-            raise ValueError("prskill requires spec.service_id (which catalogue service to order)")
-        # Estimate-first: fetch catalogue, compute cost, enforce max_cost BEFORE /add.
-        price_per_unit = await self._service_rate(spec.service_id)
+            raise ValueError("prskill requires spec.service_id (service from /services)")
+        price_per_unit = await self._service_price(spec.service_id)
         cost = price_per_unit * spec.quantity
         if cost > spec.max_cost:
             raise ValueError(f"computed cost {cost:.2f} exceeds spec.max_cost {spec.max_cost:.2f}")
-
-        # Build the extra fields required by the service (e.g. service_url).
-        # The catalogue entry tells us which fields are expected.
-        service = await self._get_service(spec.service_id)
-        fields = service.get("fields") or []
-        params: dict[str, Any] = {
-            "key": self._api_key,
-            "action": "add",
-            "service": str(spec.service_id),
-            "quantity": str(spec.quantity),
-        }
-        # The target URL goes into the field named in the service descriptor.
-        for field in fields:
-            field_name = field.get("name", "service_url")
-            if field.get("required", False) or field_name == "service_url":
-                params[field_name] = spec.target
-        # If no fields descriptor, default to service_url.
-        if "service_url" not in params:
-            params["service_url"] = spec.target
-
-        data = await self._post(params)
+        data = await self._post(
+            {
+                "action": "add",
+                "service": str(spec.service_id),
+                "link": spec.target,
+                "quantity": str(spec.quantity),
+            }
+        )
         external_id = str(data["order"])
         return external_id, cost
 
     async def get_order_status(self, external_order_id: str) -> str:
-        data = await self._post(
-            {
-                "key": self._api_key,
-                "action": "status",
-                "order": str(external_order_id),
-            }
-        )
-        orders = data.get("orders")
-        if not isinstance(orders, dict):
+        data = await self._post({"action": "status", "order": str(external_order_id)})
+        status_raw = data.get("status") if isinstance(data, dict) else None
+        if not isinstance(status_raw, str):
             return "failed"
-        raw_status = orders.get(str(external_order_id))
-        if not isinstance(raw_status, str):
-            return "failed"
-        return _STATUS_MAP.get(raw_status, "failed")
+        return _STATUS_MAP.get(status_raw.strip().lower(), "failed")
 
     # --- internal helpers --------------------------------------------------
 
-    async def _post(self, params: dict[str, Any]) -> dict[str, Any]:
-        response = await self._client.post(_BASE_URL, data=params)
+    async def _post(self, params: dict[str, Any]) -> Any:
+        """Perfect Panel returns dicts for most actions and a bare list for
+        `services`; we surface both shapes and let callers branch.
+        """
+        body = {"key": self._api_key, **params}
+        response = await self._client.post(_BASE_URL, data=body)
         response.raise_for_status()
-        try:
-            payload = response.json()
-        except Exception as exc:
-            # PRSkill sometimes returns plain text errors.
-            raise RuntimeError(f"prskill returned error string: {response.text!r}") from exc
-        # PRSkill does not wrap responses in a status envelope like smmcode.
-        # Errors are returned as strings or with "error" key.
-        if isinstance(payload, str):
-            raise RuntimeError(f"prskill returned error string: {payload!r}")
+        payload = response.json()
         if isinstance(payload, dict) and "error" in payload:
-            raise RuntimeError(f"prskill error: {payload['error']!r}")
+            safe = {k: v for k, v in payload.items() if k != "key"}
+            raise RuntimeError(f"prskill {params.get('action')!r} returned error: {safe!r}")
         return payload
 
-    async def list_services_for_scenario(
-        self,
-        scenario: Scenario,
-        limit: int = 8,
-    ) -> list[ServiceOption]:
-        """Filter cached `/services` by name keywords for the chosen scenario.
-        Sorted by price-per-unit (here `rate`) ascending.
-        """
-        services = await self._get_services()
-        keywords = keywords_for_scenario(scenario)
-        if not keywords:
-            return []
-        candidates: list[ServiceOption] = []
-        for svc in services.values():
-            name = str(svc.get("name", ""))
-            haystack = name.lower()
-            if not any(kw in haystack for kw in keywords):
-                continue
-            try:
-                rate = float(svc.get("rate", 0))
-            except (TypeError, ValueError):
-                rate = 0.0
-            if rate <= 0:
-                continue
-            try:
-                min_q = int(svc.get("min", 0)) or None
-            except (TypeError, ValueError):
-                min_q = None
-            try:
-                max_q = int(svc.get("max", 0)) or None
-            except (TypeError, ValueError):
-                max_q = None
-            candidates.append(
-                ServiceOption(
-                    service_id=str(svc.get("service", svc.get("id", ""))),
-                    name=name,
-                    price_per_unit=rate,
-                    min_quantity=min_q,
-                    max_quantity=max_q,
-                )
-            )
-        candidates.sort(key=lambda s: (s.price_per_unit or 0.0, s.name))
-        return candidates[:limit]
-
-    async def _service_rate(self, service_id: str) -> float:
+    async def _service_price(self, service_id: str) -> float:
         services = await self._get_services()
         service = services.get(str(service_id))
         if service is None:
             raise ValueError(f"prskill: service_id {service_id} not in catalogue")
-        return float(service["rate"])
-
-    async def _get_service(self, service_id: str) -> dict[str, Any]:
-        services = await self._get_services()
-        service = services.get(str(service_id))
-        if service is None:
-            raise ValueError(f"prskill: service_id {service_id} not in catalogue")
-        return service
+        # Perfect Panel exposes per-1000 rates; price-per-unit = rate / 1000.
+        rate = float(service["rate"])
+        return rate / 1000.0
 
     async def _get_services(self) -> dict[str, dict[str, Any]]:
         if (
             self._services_cache is None
             or time.monotonic() - self._services_cache_at > _SERVICES_TTL_SECONDS
         ):
-            data = await self._post({"key": self._api_key, "action": "services"})
-            raw = data if isinstance(data, list) else data.get("services", [])
+            data = await self._post({"action": "services"})
+            # Perfect Panel `services` returns a bare JSON list; tolerate dict-
+            # wrapped variants in case a particular panel echoes differently.
+            if isinstance(data, list):
+                raw = data
+            elif isinstance(data, dict):
+                raw = data.get("services") or data.get("data") or []
+            else:
+                raw = []
             flat: dict[str, dict[str, Any]] = {}
-            for svc in raw:
-                if isinstance(svc, dict) and "service" in svc:
-                    flat[str(svc["service"])] = svc
+            for service_obj in raw:
+                if isinstance(service_obj, dict) and "service" in service_obj:
+                    flat[str(service_obj["service"])] = service_obj
             self._services_cache = flat
             self._services_cache_at = time.monotonic()
         return self._services_cache

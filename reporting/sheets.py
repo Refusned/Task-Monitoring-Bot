@@ -1,154 +1,241 @@
-"""Google Sheets reporter: weekly traffic report into the «Трафик из соц сетей» tab.
+"""Google Sheets weekly report writer.
 
-A9 assumptions:
-- The spreadsheet and tab already exist; the bot writes rows into the tab.
-- If the sheet already has headers, we try to append under them (simple append).
-- Config: `google_sheets_credentials_file` (service-account JSON) and
-  `google_sheets_spreadsheet_id`.
+Pushes rows from the `report_rows` SQLite table into the operator's spreadsheet
+under the **«Трафик из соц сетей»** tab (per CLAUDE.md A9). The sheet itself
+is owned by the customer; we authenticate via a Google Service Account that
+the customer shares the spreadsheet with.
 
-If credentials are missing, the reporter logs a warning and skips — the bot stays
-usable without Sheets access.
+Idempotency: `report_rows.pushed_to_sheets_at` is set after a successful sheet
+append, so re-running the writer never duplicates rows.
+
+Column-mapping (the soft part of A9):
+- If the sheet is empty → we write our canonical header in row 1, then data.
+- If the sheet already has a header → we read it, map our fields by Russian
+  column name (case-insensitive, trimmed), and write only those columns the
+  operator's sheet has. Columns we don't recognize stay blank.
+- If the operator's header is unrecognized → fall back to canonical column
+  order and append data after the existing rows (operator can re-arrange
+  later).
+
+Threading: gspread is sync. All gspread calls run in the default executor so
+the FastAPI event loop stays free.
+
+Setup for the customer (one-time):
+1. Create a Service Account at https://console.cloud.google.com/iam-admin/serviceaccounts
+2. Enable Google Sheets API on that GCP project
+3. Download the SA JSON key → place at the path in `GOOGLE_SHEETS_CREDENTIALS_FILE`
+4. Share the target spreadsheet with the SA email (Editor permission)
+5. Put the spreadsheet ID into `GOOGLE_SHEETS_SPREADSHEET_ID` and restart
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
-from typing import Any
+import asyncio
+import logging
+from dataclasses import dataclass
+from pathlib import Path
 
-from config import Settings
-from db.database import append_audit, connect
+_LOG = logging.getLogger("sheets")
+
+# Canonical schema for our sheet — ordered. The first column header values are
+# what we write to row 1 when the sheet is empty; lookups are case-insensitive
+# stripped matches against operator-supplied headers.
+SHEET_TAB_NAME = "Трафик из соц сетей"
+
+_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("week", "Неделя"),
+    ("source_platform", "Платформа"),
+    ("exchange", "Биржа"),
+    ("ordered_count", "Заказано"),
+    ("actual_count", "Фактически"),
+    ("cost", "Стоимость"),
+    ("status", "Статус"),
+    ("order_uuid", "ID заказа"),  # bonus: helps operator trace each row back to dashboard
+)
+
+# Friendlier Russian status labels for the sheet (operator-facing).
+_STATUS_LABEL = {
+    "completed": "Готово",
+    "failed": "Ошибка",
+    "cancelled": "Отменён",
+    "verifying": "На проверке",
+    "active": "В работе",
+    "creating": "Создаётся",
+    "draft": "Черновик",
+}
+
+_FIELDS = tuple(k for k, _ in _COLUMNS)
+_CANONICAL_HEADER = tuple(v for _, v in _COLUMNS)
+# Alias map: any of these → our field key. Lets us read non-canonical headers
+# the operator may have set up in their own template.
+_HEADER_ALIASES: dict[str, str] = {
+    "неделя": "week",
+    "week": "week",
+    "период": "week",
+    "платформа": "source_platform",
+    "платформа-источник": "source_platform",
+    "platform": "source_platform",
+    "биржа": "exchange",
+    "панель": "exchange",
+    "exchange": "exchange",
+    "заказано": "ordered_count",
+    "заказано переходов": "ordered_count",
+    "ordered": "ordered_count",
+    "ordered_count": "ordered_count",
+    "фактически": "actual_count",
+    "фактически (метрика)": "actual_count",
+    "actual": "actual_count",
+    "actual_count": "actual_count",
+    "стоимость": "cost",
+    "цена": "cost",
+    "бюджет": "cost",
+    "cost": "cost",
+    "статус": "status",
+    "status": "status",
+    "id заказа": "order_uuid",
+    "order_id": "order_uuid",
+    "order_uuid": "order_uuid",
+    "uuid": "order_uuid",
+}
 
 
-def _get_week_range(anchor: datetime | None = None) -> tuple[str, str]:
-    """Return (week_label, iso_week) for the week ending today (Mon-Sun)."""
-    now = anchor or datetime.now(UTC)
-    # ISO week: Monday start
-    monday = now - timedelta(days=now.weekday())
-    sunday = monday + timedelta(days=6)
-    label = f"{monday.strftime('%Y-%m-%d')} – {sunday.strftime('%Y-%m-%d')}"
-    iso = now.strftime("%G-W%V")
-    return label, iso
+@dataclass(frozen=True)
+class SyncResult:
+    pushed: int                # rows newly written to the sheet
+    skipped: int               # rows we couldn't render (silently — count for ops)
+    spreadsheet_title: str
+    tab_title: str
 
 
-async def _build_report_rows(
-    settings: Settings,
-    week_label: str,
-    iso_week: str,
-) -> list[dict[str, Any]]:
-    """Query the local DB for completed SOCIAL_TRAFFIC orders in the current week
-    and return rows ready for Sheets.
+class SheetsWriter:
+    """Thin wrapper around `gspread` with our column logic.
+
+    Construct once at app startup (see app.state.build_app_state). Cheap to
+    keep around; gspread holds an httplib2 session.
     """
-    async with connect(settings) as conn:
-        cursor = await conn.execute(
-            "SELECT source_platform, exchange, "
-            "SUM(ordered_count) AS ordered_count, "
-            "SUM(COALESCE(actual_count, 0)) AS actual_count, "
-            "SUM(COALESCE(cost, 0)) AS cost, "
-            "GROUP_CONCAT(DISTINCT status) AS status "
-            "FROM report_rows WHERE week = ? "
-            "GROUP BY source_platform, exchange "
-            "ORDER BY source_platform, exchange",
-            (iso_week,),
-        )
-        rows = await cursor.fetchall()
 
-    return [
-        {
-            "week": week_label,
-            "source_platform": row["source_platform"],
-            "exchange": row["exchange"],
-            "ordered_count": int(row["ordered_count"] or 0),
-            "actual_count": int(row["actual_count"] or 0),
-            "cost": float(row["cost"] or 0),
-            "status": row["status"] or "unknown",
-        }
-        for row in rows
-    ]
+    def __init__(
+        self,
+        credentials_path: str | Path,
+        spreadsheet_id: str,
+        tab_name: str = SHEET_TAB_NAME,
+    ) -> None:
+        path = Path(credentials_path).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Google Sheets credentials file not found: {path}. "
+                "Set GOOGLE_SHEETS_CREDENTIALS_FILE in .env."
+            )
+        if not spreadsheet_id:
+            raise ValueError("spreadsheet_id is required (GOOGLE_SHEETS_SPREADSHEET_ID)")
+        self._credentials_path = path
+        self._spreadsheet_id = spreadsheet_id
+        self._tab_name = tab_name
+        # gspread client is lazy-built per call so a bad creds file doesn't
+        # crash the FastAPI startup — health_check() surfaces the failure cleanly.
+        self._client = None  # type: ignore[assignment]
 
-
-async def preview_weekly_rows(settings: Settings) -> list[dict[str, Any]]:
-    """Return current weekly rows without writing to Google Sheets."""
-    week_label, iso_week = _get_week_range()
-    return await _build_report_rows(settings, week_label, iso_week)
-
-
-class SheetsReporter:
-    """Thin wrapper around gspread. Lazy-connects on first use."""
-
-    def __init__(self, settings: Settings) -> None:
-        self._settings = settings
-        self._client: Any | None = None
-        self._spreadsheet: Any | None = None
-
-    def _connect(self) -> Any:
-        if self._client is not None:
-            return self._client
-        creds_file = self._settings.google_sheets_credentials_file
-        if not creds_file:
-            raise RuntimeError("GOOGLE_SHEETS_CREDENTIALS_FILE not configured")
-        import gspread
+    def _build_client(self):
         from google.oauth2.service_account import Credentials
+        import gspread
 
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        credentials = Credentials.from_service_account_file(creds_file, scopes=scopes)
-        self._client = gspread.authorize(credentials)
-        return self._client
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive.readonly",
+        ]
+        creds = Credentials.from_service_account_file(str(self._credentials_path), scopes=scopes)
+        return gspread.authorize(creds)
 
-    def _get_worksheet(self, title: str = "Трафик из соц сетей") -> Any:
-        if self._spreadsheet is None:
-            ss_id = self._settings.google_sheets_spreadsheet_id
-            if not ss_id:
-                raise RuntimeError("GOOGLE_SHEETS_SPREADSHEET_ID not configured")
-            self._spreadsheet = self._connect().open_by_key(ss_id)
+    def _open_worksheet(self):
+        if self._client is None:
+            self._client = self._build_client()
+        sheet = self._client.open_by_key(self._spreadsheet_id)
         try:
-            return self._spreadsheet.worksheet(title)
-        except Exception as exc:
-            raise RuntimeError(f"Worksheet '{title}' not found: {exc}") from exc
+            return sheet, sheet.worksheet(self._tab_name)
+        except Exception:
+            # Tab doesn't exist — create it.
+            ws = sheet.add_worksheet(title=self._tab_name, rows=200, cols=len(_COLUMNS) + 2)
+            ws.append_row(list(_CANONICAL_HEADER))
+            return sheet, ws
 
-    def append_report_rows(self, rows: list[list[str | int | float]]) -> None:
-        """Append rows to the worksheet. Each inner list is one row."""
-        ws = self._get_worksheet()
-        if rows:
-            ws.append_rows(rows, value_input_option="USER_ENTERED")
+    # --- async wrappers (gspread is sync, don't block the loop) -----------
 
-    async def run_weekly_report(self) -> None:
-        """Fetch current-week data from DB and write to Sheets."""
-        week_label, iso_week = _get_week_range()
-        rows = await _build_report_rows(self._settings, week_label, iso_week)
+    async def health_check(self) -> dict:
+        """Open spreadsheet + tab; return metadata. Useful for /api/sheets/test."""
+        loop = asyncio.get_running_loop()
+
+        def _go():
+            sheet, ws = self._open_worksheet()
+            return {
+                "spreadsheet_id": self._spreadsheet_id,
+                "spreadsheet_title": sheet.title,
+                "tab_title": ws.title,
+                "row_count": ws.row_count,
+                "col_count": ws.col_count,
+                "first_row": ws.row_values(1) if ws.row_count > 0 else [],
+            }
+
+        return await loop.run_in_executor(None, _go)
+
+    async def append_rows(self, rows: list[dict]) -> SyncResult:
+        """Append `rows` to the sheet honoring the existing header layout.
+
+        Each row dict must have the keys from `_FIELDS`. Missing keys → blank.
+        """
         if not rows:
-            return
+            return SyncResult(pushed=0, skipped=0, spreadsheet_title="", tab_title=self._tab_name)
+        loop = asyncio.get_running_loop()
 
-        # Flatten to lists matching the expected header order
-        sheet_rows: list[list[str | int | float]] = []
-        for r in rows:
-            sheet_rows.append(
-                [
-                    r["week"],
-                    r["source_platform"],
-                    r["exchange"],
-                    r["ordered_count"],
-                    r["actual_count"],
-                    r["cost"],
-                    r["status"],
-                ]
+        def _go() -> SyncResult:
+            sheet, ws = self._open_worksheet()
+            header = ws.row_values(1)
+            if not header:
+                ws.append_row(list(_CANONICAL_HEADER))
+                header = list(_CANONICAL_HEADER)
+            field_for_col = _build_field_for_col(header)
+            payload: list[list] = []
+            skipped = 0
+            for r in rows:
+                try:
+                    row_values = _row_to_cells(r, field_for_col)
+                except Exception as exc:
+                    _LOG.warning("skipping unrenderable row %r: %r", r, exc)
+                    skipped += 1
+                    continue
+                payload.append(row_values)
+            if payload:
+                ws.append_rows(payload, value_input_option="USER_ENTERED")
+            return SyncResult(
+                pushed=len(payload),
+                skipped=skipped,
+                spreadsheet_title=sheet.title,
+                tab_title=ws.title,
             )
 
-        try:
-            self.append_report_rows(sheet_rows)
-        except Exception as exc:
-            async with connect(self._settings) as conn:
-                await append_audit(
-                    conn,
-                    actor="sheets_reporter",
-                    event="weekly_report_failed",
-                    details={"error": str(exc), "error_type": type(exc).__name__},
-                )
-            raise
+        return await loop.run_in_executor(None, _go)
 
-        async with connect(self._settings) as conn:
-            await append_audit(
-                conn,
-                actor="sheets_reporter",
-                event="weekly_report_sent",
-                details={"week": week_label, "row_count": len(sheet_rows)},
-            )
+
+def _build_field_for_col(header: list[str]) -> list[str | None]:
+    """Map each column index → our field name (or None if unrecognized)."""
+    out: list[str | None] = []
+    for raw in header:
+        key = (raw or "").strip().lower()
+        out.append(_HEADER_ALIASES.get(key))
+    return out
+
+
+def _row_to_cells(row: dict, field_for_col: list[str | None]) -> list:
+    """Pull values from `row` in the order the operator's header demands."""
+    cells: list = []
+    for field in field_for_col:
+        if field is None:
+            cells.append("")
+            continue
+        value = row.get(field)
+        if field == "status" and isinstance(value, str):
+            value = _STATUS_LABEL.get(value, value)
+        if value is None:
+            cells.append("")
+        else:
+            cells.append(value)
+    return cells

@@ -1,0 +1,21 @@
+[Unit]
+Description=SMM Agent OpenClaw gateway
+After=network-online.target smm-agent-backend.service
+Wants=network-online.target smm-agent-backend.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/smm-agent
+Environment=HOME=/root
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/smm-agent/scripts/run_openclaw_gateway.sh
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
